@@ -10,17 +10,13 @@ from dateutil.relativedelta import relativedelta
 from os import environ
 import re
 import csv
-import json
 from dataclasses import dataclass
 from textwrap import dedent
 from http import HTTPStatus
 from asyncio import run, wait_for
 from collections import namedtuple
-from email.message import Message
 from email.parser import BytesHeaderParser, BytesParser
 from email.header import decode_header
-from typing import Collection
-import email
 import asyncio
 import concurrent.futures
 import aioimaplib
@@ -113,6 +109,9 @@ def get_initials_config():
 
     try:
         settings = get_settings()
+        if settings is None:
+            logger.error(f"Required environment vars not provided.")
+            sys.exit(EXIT_CODE)
     except ValueError:
         logger.error(f"The value of ORGANIZATION_ID_ARG must be an integer.")
         sys.exit(EXIT_CODE)
@@ -220,6 +219,24 @@ def get_settings():
         dry_run = False,
         search_param = {}
     )
+
+    exit_flag = False
+    if not settings.oauth_token:
+        logger.error("OAUTH_TOKEN_ARG is not set")
+        exit_flag = True
+
+    if settings.organization_id == 0:
+        logger.error("ORGANIZATION_ID_ARG is not set")
+        exit_flag = True
+
+    if not settings.application_client_id:
+        logger.error("APPLICATION_CLIENT_ID_ARG is not set")
+        exit_flag = True
+
+    if not settings.application_client_secret:
+        logger.error("APPLICATION_CLIENT_SECRET_ARG is not set")
+        exit_flag = True
+
     if os.environ.get("DRY_RUN"):
         if os.environ.get("DRY_RUN").lower() == "true":
             settings.dry_run = True
@@ -227,10 +244,13 @@ def get_settings():
             settings.dry_run = False
         else:
             logger.error("DRY_RUN must be true or false")
-            sys.exit(EXIT_CODE)
+            exit_flag = True
     else:
         settings.dry_run = False
 
+    if exit_flag:
+        return None
+    
     return settings
 
 def fetch_audit_logs(settings: "SettingParams"):
@@ -465,7 +485,7 @@ async def get_imap_messages_and_delete(user_mail: str, token: str, settings: "Se
 
     search_criteria = f'(SINCE {first_date.strftime("%d-%b-%Y")}) BEFORE {last_date.strftime("%d-%b-%Y")}'
     with concurrent.futures.ThreadPoolExecutor() as pool:
-        logger.debug(f"Connect to IMAP server for {user_mail}")
+        #logger.debug(f"Connect to IMAP server for {user_mail}")
         await loop.run_in_executor(pool, log_debug, f"Connect to IMAP server for {user_mail}")
     try:
         imap_connector = aioimaplib.IMAP4_SSL(host=DEFAULT_IMAP_SERVER, port=DEFAULT_IMAP_PORT)
