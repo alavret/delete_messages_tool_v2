@@ -5,7 +5,7 @@ import logging
 import logging.handlers as handlers
 import os.path
 import sys
-from datetime import datetime, timedelta
+import datetime
 from dateutil.relativedelta import relativedelta
 from os import environ
 import re
@@ -32,9 +32,9 @@ DEFAULT_IMAP_PORT = 993
 DEFAULT_360_API_URL = "https://api360.yandex.net"
 DEFAULT_OAUTH_API_URL = "https://oauth.yandex.ru/token"
 LOG_FILE = "get_audit.log"
-DEFAULT_DAYS_AGO = 45
+DEFAULT_DAYS_DIF = 1
 FILTERED_EVENTS = ["message_receive"]
-FILTERED_MAILBOXES = ["alavret@yandry.ru"]
+FILTERED_MAILBOXES = []
 
 
 ID_HEADER_SET = {'Content-Type', 'From', 'To', 'Cc', 'Bcc', 'Date', 'Subject',
@@ -89,15 +89,19 @@ def arg_parser():
         return int(value)
 
     parser.add_argument(
-        "--rfc-message-id", help="Message subject", type=str, required=False
+        "--id", help="Message ID", type=str, required=False
+    )
+
+    parser.add_argument(
+        "--date", help="Message date (DD-MM-YYYY)", type=str, required=False
     )
         
-    parser.add_argument(
-        "--days-ago",
-        help="Number of days ago to search and download audit log records [0, 90]",
-        type=argument_range,
-        required=False,
-    )
+    # parser.add_argument(
+    #     "--date",
+    #     help="Message date",
+    #     type=argument_range,
+    #     required=False,
+    # )
     return parser
 
 def get_initials_config():
@@ -118,21 +122,21 @@ def get_initials_config():
         sys.exit(EXIT_CODE)
 
     input_params = {}
-    if args.days_ago is None: 
-        logger.warning("Command line argument 'days_ago' is not set. Using default value - {DEFAULT_DAYS_AGO} days ago  }.")
-        args.date_ago = DEFAULT_DAYS_AGO
-    input_params["days_ago"] = args.date_ago
 
-    if args.rfc_message_id is None: 
-        input_params["message_ids"] = []
-    else:
-        l = []
-        l.append(args.rfc_message_id)
-        input_params["message_ids"] = l
-
+    input_params["days_diff"] = DEFAULT_DAYS_DIF
+    input_params["message_id"] = ""
+    input_params["message_date"] = ""
     input_params["events"] = FILTERED_EVENTS
     input_params["mailboxes"] = FILTERED_MAILBOXES
-    input_params["days_interval"] = args.date_ago
+
+    if args.id is not None: 
+        input_params["message_id"] = args.id
+    
+    if args.date is not None:
+        status, date = is_valid_date(args.date.strip(), min_years_diff=0, max_years_diff=20)
+        if status:
+            input_params["message_date"] = date.strftime("%d-%m-%Y")
+
     settings.search_param = input_params
 
     return settings
@@ -202,6 +206,7 @@ class SettingParams:
     mailboxes_to_search_file_name: str
     application_client_id: str
     application_client_secret: str
+    dry_run: bool
     search_param : dict
 
 def get_settings():
@@ -212,12 +217,31 @@ def get_settings():
         application_client_secret = os.environ.get("APPLICATION_CLIENT_SECRET_ARG"),
         message_id_file_name = os.environ.get("MESSAGE_ID_FILE_NAME"),
         mailboxes_to_search_file_name = os.environ.get("MAILBOXES_TO_SEARCH_FILE_NAME"),
+        dry_run = False,
         search_param = {}
     )
+    if os.environ.get("DRY_RUN"):
+        if os.environ.get("DRY_RUN").lower() == "true":
+            settings.dry_run = True
+        elif os.environ.get("DRY_RUN").lower() == "false":
+            settings.dry_run = False
+        else:
+            logger.error("DRY_RUN must be true or false")
+            sys.exit(EXIT_CODE)
+    else:
+        settings.dry_run = False
+
     return settings
 
-def fetch_audit_logs(settings: "SettingParams", days_ago: int):
-    day_last_check = (datetime.now().replace(hour=0, minute=0, second=0) - timedelta(days=days_ago)).strftime("%Y-%m-%dT%H:%M:%SZ")
+def fetch_audit_logs(settings: "SettingParams"):
+    msg_date = datetime.datetime.strptime(settings.search_param["message_date"], "%d-%m-%Y")
+
+    first_date =  msg_date + relativedelta(days = -settings.search_param["days_diff"], hour = 0, minute = 0, second = 0) 
+    last_date = msg_date + relativedelta(days = settings.search_param["days_diff"]+1, hour = 0, minute = 0, second = 0)
+    logger.info(f"Search data from {first_date.strftime("%Y-%m-%d")} to {last_date.strftime("%Y-%m-%d")}.")
+    final_first_date = first_date.strftime("%Y-%m-%dT%H:%M:%SZ")
+    final_last_date = last_date.strftime("%Y-%m-%dT%H:%M:%SZ")
+    #day_last_check = (datetime.now().replace(hour=0, minute=0, second=0) - timedelta(days=days_ago)).strftime("%Y-%m-%dT%H:%M:%SZ")
     log_records = []
 
     url = f"{DEFAULT_360_API_URL}/security/v1/org/{settings.organization_id}/audit_log/mail"
@@ -225,9 +249,15 @@ def fetch_audit_logs(settings: "SettingParams", days_ago: int):
 
     params = {
         "pageSize": 100,
-        "afterDate": day_last_check,
+        "afterDate": final_first_date,
+        "beforeDate": final_last_date,
+        #"includeUids": filtered_uids,
+        "types": FILTERED_EVENTS
     }
-    
+
+    url = f"{DEFAULT_360_API_URL}/security/v1/org/{settings.organization_id}/audit_log/mail"
+    headers = {"Authorization": f"OAuth {settings.oauth_token}"}
+
     while True:           
         try:
             response = requests.get(url, headers=headers, params=params)
@@ -274,10 +304,102 @@ def write_to_ifarma_file(data, filename):
         writer.writeheader()
         writer.writerows(prepared_data)
 
+def is_valid_date(date_string, min_years_diff=0, max_years_diff=20):
+    """
+    Проверяет, можно ли преобразовать строку в дату.
+    
+    Поддерживает несколько распространенных форматов даты:
+    - DD.MM.YYYY
+    - DD/MM/YYYY
+    - DD-MM-YYYY
+    - YYYY-MM-DD
+    - YYYY/MM/DD
+    
+    Args:
+        date_string (str): Строка для проверки
+        
+    Returns:
+        bool: True если строка может быть преобразована в дату, иначе False
+        datetime.date: Объект даты в случае успеха, иначе None
+    """
+    # Проверяем, что строка не пустая
+    if not date_string or not isinstance(date_string, str):
+        return False, None
+    
+    # Набор возможных форматов для проверки
+    date_formats = [
+        '%d.%m.%Y',  # DD.MM.YYYY
+        '%d/%m/%Y',  # DD/MM/YYYY
+        '%d-%m-%Y',  # DD-MM-YYYY
+        '%Y-%m-%d',  # YYYY-MM-DD (ISO формат)
+        '%Y/%m/%d',  # YYYY/MM/DD
+        '%m/%d/%Y',  # MM/DD/YYYY (US формат)
+        '%d.%m.%y',  # DD.MM.YY
+        '%Y.%m.%d',  # YYYY.MM.DD
+    ]
+    
+    # Попытка парсинга каждым из форматов
+    current_date = datetime.date.today()
+    for date_format in date_formats:
+        try:
+            date_obj = datetime.datetime.strptime(date_string, date_format).date()
+
+            years_diff = abs((current_date.year - date_obj.year) + 
+                (current_date.month - date_obj.month) / 12 +
+                (current_date.day - date_obj.day) / 365.25)
+            
+            # if years_diff < min_years_diff:
+            #     return False, f"Дата отстоит от текущей менее, чем на {min_years_diff} лет"
+            if years_diff > max_years_diff:
+                return False, f"Дата отстоит от текущей более, чем на {max_years_diff} лет"
+            # Дополнительная проверка на валидность (для високосных лет и т.д.)
+            # Эта проверка не требуется, т.к. strptime уже выбросит исключение для невалидной даты
+            return True, date_obj
+        except ValueError:
+            continue
+    
+    # Если ни один из форматов не подошел, проверяем с помощью регулярных выражений
+    # для потенциально более сложных форматов
+    date_patterns = [
+        # Месяц прописью на английском: 25 December 2021, December 25, 2021
+        r'(\d{1,2})\s+(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{4})',
+        r'(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{1,2}),?\s+(\d{4})',
+    ]
+    
+    month_map = {
+        'January': 1, 'February': 2, 'March': 3, 'April': 4, 'May': 5, 'June': 6,
+        'July': 7, 'August': 8, 'September': 9, 'October': 10, 'November': 11, 'December': 12
+    }
+    
+    for pattern in date_patterns:
+        match = re.search(pattern, date_string, re.IGNORECASE)
+        if match:
+            groups = match.groups()
+            try:
+                if len(groups) == 3:
+                    # 25 December 2021
+                    if groups[0].isdigit() and groups[2].isdigit():
+                        day = int(groups[0])
+                        month = month_map[groups[1].capitalize()]
+                        year = int(groups[2])
+                    # December 25, 2021
+                    else:
+                        month = month_map[groups[0].capitalize()]
+                        day = int(groups[1])
+                        year = int(groups[2])
+                    
+                    date_obj = datetime.date(year, month, day)
+                    return True, date_obj
+            except (ValueError, KeyError):
+                continue
+    
+    return False, None
+
 def parse_to_dict(data: dict):
     #obj = json.dumps(data)
     d = {}
     d["eventType"] = data.get("eventType",'')
+    d["raw_date"] = data.get("date")
     d["date"] = data.get("date").replace('T', ' ').replace('Z', '')
     d["userLogin"] = data.get("userLogin",'')
     d["userName"] = data.get("userName",'')
@@ -325,23 +447,27 @@ def get_user_token(user_mail: str, settings: "SettingParams"):
         "subject_token_type": "urn:yandex:params:oauth:token-type:email",
     }
     response = requests.post(url=DEFAULT_OAUTH_API_URL, headers=headers, data=data)
-    logger.debug(f"User token for {user_mail} received")
-    return response.json()["access_token"]
-    if response.status_code != HTTPStatus.OK.value:
-        logger.exception(f"Error during GET request: {response.status_code}")
-    return ''
 
-async def get_imap_messages(user_mail: str, token: str, days_ago: int, imap_messages: dict):
+    if response.status_code != HTTPStatus.OK.value:
+        logger.exception(f"Error during getiing user token: {response.status_code}")
+        return ''
+    else:
+        logger.info(f"User token for {user_mail} received")
+        return response.json()["access_token"]
+
+async def get_imap_messages_and_delete(user_mail: str, token: str, settings: "SettingParams", imap_messages: dict):
     message_dict = {}
     loop = asyncio.get_running_loop()
-    today = datetime.now() 
-    date_days_ago = today - timedelta(days=days_ago)
-    search_criteria = f'(SINCE {date_days_ago.strftime("%d-%b-%Y")})'
+    msg_date = datetime.datetime.strptime(settings.search_param["message_date"], "%d-%m-%Y")
+    first_date =  msg_date + relativedelta(days = -settings.search_param["days_diff"], hour = 0, minute = 0, second = 0) 
+    last_date = msg_date + relativedelta(days = settings.search_param["days_diff"]+1, hour = 0, minute = 0, second = 0)
+    search_id = f'<{settings.search_param["message_id"].replace("<", "").replace(">", "").strip()}>'
+
+    search_criteria = f'(SINCE {first_date.strftime("%d-%b-%Y")}) BEFORE {last_date.strftime("%d-%b-%Y")}'
     with concurrent.futures.ThreadPoolExecutor() as pool:
         logger.debug(f"Connect to IMAP server for {user_mail}")
         await loop.run_in_executor(pool, log_debug, f"Connect to IMAP server for {user_mail}")
     try:
-        imap_connector = aioimaplib.IMAP4_SSL(host=DEFAULT_IMAP_SERVER, port=DEFAULT_IMAP_PORT)
         imap_connector = aioimaplib.IMAP4_SSL(host=DEFAULT_IMAP_SERVER, port=DEFAULT_IMAP_PORT)
         await imap_connector.wait_hello_from_server()
         await imap_connector.xoauth2(user=user_mail, token=token)
@@ -373,7 +499,7 @@ async def get_imap_messages(user_mail: str, token: str, days_ago: int, imap_mess
                                 message_dict["flags"] = flags.decode("ascii")
                                 message_dict["seqnum"] = int(seqnum.decode("ascii"))
                                 message_dict["folder"] = folder
-                                print(message_attrs)
+                                #print(message_attrs)
 
                                 # uid fetch always includes the UID of the last message in the mailbox
                                 # cf https://tools.ietf.org/html/rfc3501#page-61
@@ -389,11 +515,19 @@ async def get_imap_messages(user_mail: str, token: str, days_ago: int, imap_mess
                                                 header_value.append(s[0].decode("ascii").strip())
                                             else:
                                                 header_value.append(s[0])
-                                    with concurrent.futures.ThreadPoolExecutor() as pool:
-                                        await loop.run_in_executor(pool, log_debug, f'{header}: {" ".join(header_value) if len(header_value) > 1 else header_value[0]}')
+                                    #with concurrent.futures.ThreadPoolExecutor() as pool:
+                                    #    await loop.run_in_executor(pool, log_debug, f'{header}: {" ".join(header_value) if len(header_value) > 1 else header_value[0]}')
                                     #print(f'{header}: {" ".join(header_value.split()) if len(header_value) > 1 else header_value[0]}')
                                     message_dict[header.lower()] = f'{" ".join(header_value) if len(header_value) > 1 else header_value[0]}'
                         imap_messages[message_dict["message-id"]] = message_dict
+                        if message_dict["message-id"] == search_id:
+                            if not settings.dry_run:
+                                with concurrent.futures.ThreadPoolExecutor() as pool:
+                                    await loop.run_in_executor(pool, log_info, f"Delete message {message_dict['message-id']} in {message_dict['folder']} for {user_mail}")
+                                await imap_connector.store(int(num), "+FLAGS", "\\Deleted")
+                            else:
+                                with concurrent.futures.ThreadPoolExecutor() as pool:
+                                    await loop.run_in_executor(pool, log_info, f"DRY_RUN is TRUE: Virtually delete message {message_dict['message-id']} in {message_dict['folder']} for {user_mail}")
             else:
                 continue
 
@@ -407,6 +541,8 @@ def map_folder(folder: Optional[bytes]) -> Optional[str]:
     if not folder or folder == b"LIST Completed.":
         return None
     valid = folder.decode("ascii").split('"|"')[-1].strip().strip('""')
+    if valid.startswith('&'):
+        return None
     return f'"{valid}"'
 
 def main_menu(settings: SettingParams):
@@ -414,267 +550,332 @@ def main_menu(settings: SettingParams):
     while True:
         print("\n")
         print("---------------------- Config params ----------------------")
-        for key, value in settings.search_param.items():
-            print(f"{key}: {value}")
+        print(f'Message ID: {settings.search_param["message_id"]}')
+        print(f'Message date: {settings.search_param["message_date"]}')
+        print(f'Days to search from message date: {settings.search_param["days_diff"]}')
+        print(f'Mailboxes to search: {settings.search_param["mailboxes"]}')
         print("------------------------------------------------------------")
-        #print("\n")
+        print("\n")
         print("Select option:")
-        print("1. Set messate id.")
-        print("2. Set days ago.")
-        print("3. Enter count of days for search.")
-        print("4. Enter mailboxes to search nemu.")
-        print("5. Search and delete menu.")
+        print("1. Enter search params manually.")
+        print("2. Load search param from file.")
+        print("3. Clear search param.")
+        print("4. Start deleting messages.")
         # print("3. Delete all contacts.")
         # print("4. Output bad records to file")
         print("0. Exit")
 
-        choice = input("Enter your choice (0-5): ")
+        choice = input("Enter your choice (0-4): ")
 
         if choice == "0":
             print("Goodbye!")
             break
         elif choice == "1":
-            set_message_id_menu(settings)
+            manually_search_params_menu(settings)
         elif choice == "2":
-            set_days_ago(settings)
+            #set_days_ago(settings)
+            pass
         elif choice == "3":
-            set_count_of_days(settings)
+            clear_search_params(settings)
         elif choice == "4":
-            set_mailboxes_menu(settings)
+            delete_messages(settings)
+            pass
         else:
             print("Invalid choice. Please try again.")
     return settings
 
-def set_days_ago(settings: SettingParams):
-    print("\n")
-    print("----------------- Set days ago ----------------------")
-    print(f"Current days ago: {settings.search_param['days_ago']}")
-    print("-----------------------------------------------------")
-    print("\n")
-    answer = input("Enter number of days ago to search from (empty string to cancel): ")
-    if answer:
-        if answer.isdigit():
-            if int(answer) > 0 and int(answer) < 90:
-                settings.search_param['days_ago'] = int(answer)
-                settings.search_param['days_interval'] = int(answer)
-            else:
-                print("Invalid number of days ago (max 90 days). Please try again.")
-    return settings
-
-def set_count_of_days(settings: SettingParams):
-    print("\n")
-    print("----------------- Set number of days to search ----------------------")
-    print(f"Current days ago: {settings.search_param['days_interval']}")
-    print("---------------------------------------------------------------------")
-    print("\n")
-    answer = input("Enter number of days to search to (empty string to cancel): ")
-    if answer:
-        if answer.isdigit():
-            if int(answer) > 0 and int(answer) < settings.search_param['days_ago']:
-                settings.search_param['days_interval'] = int(answer)
-            else:
-                print(f"Invalid number of days ago (max {settings.search_param['days_ago']} days). Please try again.")
-    return settings
-
-
-def set_mailboxes_menu(settings: SettingParams):
+def manually_search_params_menu(settings: SettingParams):
     while True:
         print("\n")
-        print("----------------- Set mailboxes to search menu ----------------------")
-        print(f"Current mailboxes list: {settings.search_param['mailboxes']}")
-        print("---------------------------------------------------------------------")
-        #print("\n")
+        print("---------------------- Config params ----------------------")
+        print(f'Message ID: {settings.search_param["message_id"]}')
+        print(f'Message date: {settings.search_param["message_date"]}')
+        print(f'Days to search from message date: {settings.search_param["days_diff"]}')
+        print(f'Mailboxes to search: {settings.search_param["mailboxes"]}')
+        print("------------------------------------------------------------")
+        print("\n")
         print("Select option:")
-        print("1. Enter mailboxes to search manually.")
-        print(f"2. Load mailboxes to search from file ({settings.mailboxes_to_search_file_name}).")
-        print("3. Clear mailboxes to search.")
+        print("1. Enter message id.")
+        print("2. Enter message date.")
+        print("3. Enter days to search from target day (default is +-1).")
+        # print("4. Enter mailboxes to search.")
+        # print("5. Clear mailboxes to search.")
 
         print("0. Exit to main menu.")
 
-        choice = input("Enter your choice (0-2): ")
+        choice = input("Enter your choice (0-3): ")
 
         if choice == "0":
             #print("Goodbye!")
             break
         elif choice == "1":
             print('\n')
-            set_message_id_manually(settings)
+            set_message_id(settings)
         elif choice == "2":
             print('\n')
-            set_message_id_from_file()
+            set_message_date(settings)
         elif choice == "3":
             print('\n')
-            clear_message_id(settings)
-
+            set_days_diff(settings)
+        elif choice == "4":
+            print('\n')
+            set_mailboxes(settings)
+        elif choice == "5":
+            print('\n')
+            clear_mailboxes(settings)
         else:
             print("Invalid choice. Please try again.")
     return settings
 
-def clear_message_id(settings: SettingParams):
+def set_message_id(settings: SettingParams):
+    answer = input("Enter message id (space to clear): ")
+    if answer:
+        settings.search_param["message_id"] = answer.replace(" ", "").strip()
+    return settings
+
+def set_message_date(settings: SettingParams):
+    answer = input("Enter message date DD-MM-YYYY (space to clear): ")
+    if answer.replace(" ", "").strip():
+        status, date = is_valid_date(answer.replace(" ", "").strip(), min_years_diff=0, max_years_diff=20)
+        if status:
+            now = datetime.datetime.now().date()
+            if date > now:
+                print("Date is in the future. Please try again.")
+            else:
+                settings.search_param["message_date"] = date.strftime("%d-%m-%Y")
+        else:
+            print("Invalid date format. Please try again.")
+    else:
+        settings.search_param["message_date"] = ""
+    return settings
+
+def set_days_diff(settings: SettingParams):
+    answer = input("Enter days diff from target day: ")
+    if answer:
+        if answer.isdigit():
+            if int(answer) > 0 and int(answer) < 90:
+                settings.search_param["days_diff"] = answer.replace(" ", "").strip()
+            else:
+                print("Invalid number of days ago (max 90 days). Please try again.")
+        else:
+            print("Invalid number of days ago. Please try again.")
+        
+    return settings
+
+def set_mailboxes(settings: SettingParams):
+    answer = input("Enter several mailboxes to search (alias@domain.com), sparated by comma or semicolon:\n")
+    if answer:
+        manually_list = answer.replace(",", ";").split(";")
+        if len(manually_list) > 0:
+            settings.search_param["mailboxes"].clear()
+            for manual in manually_list:
+                if manual not in settings.search_param["mailboxes"]:
+                    settings.search_param["mailboxes"].append(manual.strip())
+        return settings
+    
+def clear_mailboxes(settings: SettingParams):
     answer = input("Clear mailboxes list? (Y/n): ")
     if answer.upper() not in ["Y", "YES"]:
         return settings
     settings.search_param["mailboxes"] = []
     return settings
 
-def set_message_id_manually(settings: SettingParams):
-    answer = input("Enter several emails, sparated by comma or semicolon: ")
-    if answer:
-        manually_list = answer.replace(",", ";").split(";")
-        for manual in manually_list:
-            settings.search_param["mailboxes"].append(manual.strip())
-        return settings
-    return settings
-    
-def set_message_id_from_file(settings: SettingParams):
-    file_name = settings.mailboxes_to_search_file_name
-    if not os.path.exists(file_name):
-        full_path = os.path.join(os.path.dirname(__file__), file_name)
-        if not os.path.exists(full_path):
-            logger.error(f'ERROR! Input file {file_name} not exist!')
-            return settings
-        else:
-            file_name = full_path            
-    
-    ## Another way to read file with needed transfromations
-    headers = []
-    data = []
-    try:
-        logger.info("-" *100)
-        logger.info(f'Reading file {file_name}')
-        logger.info("-" *100)
-        with open(file_name, 'r', encoding='utf-8') as csvfile:
-            headers = csvfile.readline().replace('"', '').replace(",",";").split(";")
-            logger.debug(f'Headers: {[h.strip() for h in headers]}')
-            for line in csvfile:
-                logger.debug(f'Reading from file line - {line}')
-                fields = line.replace('"', '').replace(",",";").split(";")
-                entry = {}
-                for i,value in enumerate(fields):
-                    entry[headers[i].strip()] = value.strip()
-                data.append(entry["mailbox"])
-        logger.info(f'End reading file {file_name}')
-        logger.info("\n")
-    except Exception as e:
-        logger.error(f"{type(e).__name__} at line {e.__traceback__.tb_lineno} of {__file__}: {e}")
-        return settings
-
-    if data:
-        logger.info("-" *100)
-        logger.info(f'Mailboxes, that will be added from file {file_name}')
-        logger.info("-" *100)
-        for line in data:
-            logger.info(line)
-
-        answer = input("Mailboxes will be replaced. Continue? (Y/n): ")
-        if answer.upper() in ["Y", "YES"]:
-            settings.search_param["mailboxes"] = []
-            settings.search_param["mailboxes"].extend(data)
-    else:
-        logger.info("-" *100)
-        logger.info(f'No lines in {file_name}')
-        logger.info("-" *100)
-    
-    return settings
-
-def set_message_id_menu(settings: SettingParams):
-    while True:
-        print("\n")
-        print("----------------- Set message id menu ----------------------")
-        print(f"Current message IDs: {settings.search_param['message_ids']}")
-        print("------------------------------------------------------------")
-        #print("\n")
-        print("Select option:")
-        print("1. Enter messate id manually.")
-        print(f"2. Load message id from file ({settings.message_id_file_name}).")
-        print("3. Clear message id.")
-
-        print("0. Exit to main menu.")
-
-        choice = input("Enter your choice (0-2): ")
-
-        if choice == "0":
-            print("Goodbye!")
-            break
-        elif choice == "1":
-            print('\n')
-            set_message_id_manually(settings)
-        elif choice == "2":
-            print('\n')
-            set_message_id_from_file(settings)
-        elif choice == "3":
-            print('\n')
-            clear_message_id(settings)
-
-        else:
-            print("Invalid choice. Please try again.")
-    return settings
-
-def clear_message_id(settings: SettingParams):
-    answer = input("Clear message-ids list? (Y/n): ")
+def clear_search_params(settings: SettingParams):
+    answer = input("Clear search params? (Y/n): ")
     if answer.upper() not in ["Y", "YES"]:
         return settings
-    settings.search_param["message_ids"] = []
+    settings.search_param["mailboxes"] = []
+    settings.search_param["message_id"] = ""
+    settings.search_param["message_date"] = ""
+    settings.search_param["days_diff"] = 1
     return settings
 
-def set_message_id_manually(settings: SettingParams):
-    answer = input("Enter several message id, sparated by comma or semicolon: ")
-    if answer:
-        manually_list = answer.replace(",", ";").split(";")
-        for manual in manually_list:
-            settings.search_param["message_ids"].append(manual.strip())
-        return settings
-    
-def set_message_id_from_file(settings: SettingParams):
-    file_name = settings.message_id_file_name
-    if not os.path.exists(file_name):
-        full_path = os.path.join(os.path.dirname(__file__), file_name)
-        if not os.path.exists(full_path):
-            logger.error(f'ERROR! Input file {file_name} not exist!')
-            return settings
-        else:
-            file_name = full_path
-    
-    ## Another way to read file with needed transfromations
-    headers = []
-    data = []
-    try:
-        logger.info("-" *100)
-        logger.info(f'Reading file {file_name}')
-        logger.info("-" *100)
-        with open(file_name, 'r', encoding='utf-8') as csvfile:
-            headers = csvfile.readline().replace('"', '').replace(",",";").split(";")
-            logger.debug(f'Headers: {[h.strip() for h in headers]}')
-            for line in csvfile:
-                logger.debug(f'Reading from file line - {line}')
-                fields = line.replace('"', '').replace(",",";").split(";")
-                entry = {}
-                for i,value in enumerate(fields):
-                    entry[headers[i].strip()] = value.strip()
-                data.append(entry["message-id"])
-        logger.info(f'End reading file {file_name}')
-        logger.info("\n")
-    except Exception as e:
-        logger.error(f"{type(e).__name__} at line {e.__traceback__.tb_lineno} of {__file__}: {e}")
-        return settings
-
-    if data:
-        logger.info("-" *100)
-        logger.info(f'Message IDs, that will be added from file {file_name}')
-        logger.info("-" *100)
-        for line in data:
-            logger.info(line)
-
-        answer = input("Message IDs will be replaced. Continue? (Y/n): ")
-        if answer.upper() in ["Y", "YES"]:
-            #settings.search_param["message_ids"].clear()
-            settings.search_param["message_ids"] = data
+def delete_messages(settings: SettingParams):
+    stop_running = False
+    if not settings.search_param["message_id"]:
+        logger.error("Message ID is empty.")
+        stop_running = True
+    if not settings.search_param["message_date"]:
+        logger.error("Message date is empty.")
+        stop_running = True
     else:
-        logger.info("-" *100)
-        logger.info(f'No lines in {file_name}')
-        logger.info("-" *100)
+        status, date = is_valid_date(settings.search_param["message_date"], min_years_diff=0, max_years_diff=20)
+        date = date + relativedelta(days = settings.search_param["days_diff"])
+        now = datetime.datetime.now().date()
+        diff = now - date
+        if diff.days > 90 and not settings.search_param["mailboxes"]:
+            logger.error("Message date is too old. Can not get mailboxes to search from audit log.")
+            stop_running = True
     
+    if stop_running:
+        return settings
+    
+    search_ids = [f"<{settings.search_param["message_id"].replace("<", "").replace(">", ",").strip()}>"]
+    if not settings.search_param["mailboxes"]:
+        logger.info("Start searching mailboxes from audit log.")
+        records = fetch_audit_logs(settings)
+        logger.info("End searching mailboxes from audit log.")
+        for r in records:
+            if r["msgId"] in search_ids:
+                logger.info(f'Found mailbox {r["userLogin"]} for message {r["msgId"]}')
+                settings.search_param["mailboxes"].append(r["userLogin"])
+
+    if not settings.search_param["mailboxes"]:
+        logger.error(f"No mailboxes was found for message {settings.search_param["message_id"]} from search in audit log.")
+        return settings
+    
+    imap_messages = {}
+    for user in settings.search_param["mailboxes"]:
+        token = get_user_token(user, settings)
+        if token:
+            asyncio.run(get_imap_messages_and_delete(user, token, settings, imap_messages ))
+            #print(imap_messages)
+
     return settings
+    
+# def set_message_id_from_file(settings: SettingParams):
+#     file_name = settings.mailboxes_to_search_file_name
+#     if not os.path.exists(file_name):
+#         full_path = os.path.join(os.path.dirname(__file__), file_name)
+#         if not os.path.exists(full_path):
+#             logger.error(f'ERROR! Input file {file_name} not exist!')
+#             return settings
+#         else:
+#             file_name = full_path            
+    
+#     ## Another way to read file with needed transfromations
+#     headers = []
+#     data = []
+#     try:
+#         logger.info("-" *100)
+#         logger.info(f'Reading file {file_name}')
+#         logger.info("-" *100)
+#         with open(file_name, 'r', encoding='utf-8') as csvfile:
+#             headers = csvfile.readline().replace('"', '').replace(",",";").split(";")
+#             logger.debug(f'Headers: {[h.strip() for h in headers]}')
+#             for line in csvfile:
+#                 logger.debug(f'Reading from file line - {line}')
+#                 fields = line.replace('"', '').replace(",",";").split(";")
+#                 entry = {}
+#                 for i,value in enumerate(fields):
+#                     entry[headers[i].strip()] = value.strip()
+#                 data.append(entry["mailbox"])
+#         logger.info(f'End reading file {file_name}')
+#         logger.info("\n")
+#     except Exception as e:
+#         logger.error(f"{type(e).__name__} at line {e.__traceback__.tb_lineno} of {__file__}: {e}")
+#         return settings
+
+#     if data:
+#         logger.info("-" *100)
+#         logger.info(f'Mailboxes, that will be added from file {file_name}')
+#         logger.info("-" *100)
+#         for line in data:
+#             logger.info(line)
+
+#         answer = input("Mailboxes will be replaced. Continue? (Y/n): ")
+#         if answer.upper() in ["Y", "YES"]:
+#             settings.search_param["mailboxes"] = []
+#             settings.search_param["mailboxes"].extend(data)
+#     else:
+#         logger.info("-" *100)
+#         logger.info(f'No lines in {file_name}')
+#         logger.info("-" *100)
+    
+#     return settings
+
+# def set_message_id_menu(settings: SettingParams):
+#     while True:
+#         print("\n")
+#         print("----------------- Set message id menu ----------------------")
+#         print(f"Current message IDs: {settings.search_param['message_ids']}")
+#         print("------------------------------------------------------------")
+#         #print("\n")
+#         print("Select option:")
+#         print("1. Enter messate id manually.")
+#         print(f"2. Load message id from file ({settings.message_id_file_name}).")
+#         print("3. Clear message id.")
+
+#         print("0. Exit to main menu.")
+
+#         choice = input("Enter your choice (0-2): ")
+
+#         if choice == "0":
+#             print("Goodbye!")
+#             break
+#         elif choice == "1":
+#             print('\n')
+#             set_message_id_manually(settings)
+#         elif choice == "2":
+#             print('\n')
+#             set_message_id_from_file(settings)
+#         elif choice == "3":
+#             print('\n')
+#             clear_message_id(settings)
+
+#         else:
+#             print("Invalid choice. Please try again.")
+#     return settings
+
+# def clear_message_id(settings: SettingParams):
+#     answer = input("Clear message-ids list? (Y/n): ")
+#     if answer.upper() not in ["Y", "YES"]:
+#         return settings
+#     settings.search_param["message_ids"] = []
+#     return settings
+
+
+    
+# def set_message_id_from_file(settings: SettingParams):
+#     file_name = settings.message_id_file_name
+#     if not os.path.exists(file_name):
+#         full_path = os.path.join(os.path.dirname(__file__), file_name)
+#         if not os.path.exists(full_path):
+#             logger.error(f'ERROR! Input file {file_name} not exist!')
+#             return settings
+#         else:
+#             file_name = full_path
+    
+#     ## Another way to read file with needed transfromations
+#     headers = []
+#     data = []
+#     try:
+#         logger.info("-" *100)
+#         logger.info(f'Reading file {file_name}')
+#         logger.info("-" *100)
+#         with open(file_name, 'r', encoding='utf-8') as csvfile:
+#             headers = csvfile.readline().replace('"', '').replace(",",";").split(";")
+#             logger.debug(f'Headers: {[h.strip() for h in headers]}')
+#             for line in csvfile:
+#                 logger.debug(f'Reading from file line - {line}')
+#                 fields = line.replace('"', '').replace(",",";").split(";")
+#                 entry = {}
+#                 for i,value in enumerate(fields):
+#                     entry[headers[i].strip()] = value.strip()
+#                 data.append(entry["message-id"])
+#         logger.info(f'End reading file {file_name}')
+#         logger.info("\n")
+#     except Exception as e:
+#         logger.error(f"{type(e).__name__} at line {e.__traceback__.tb_lineno} of {__file__}: {e}")
+#         return settings
+
+#     if data:
+#         logger.info("-" *100)
+#         logger.info(f'Message IDs, that will be added from file {file_name}')
+#         logger.info("-" *100)
+#         for line in data:
+#             logger.info(line)
+
+#         answer = input("Message IDs will be replaced. Continue? (Y/n): ")
+#         if answer.upper() in ["Y", "YES"]:
+#             #settings.search_param["message_ids"].clear()
+#             settings.search_param["message_ids"] = data
+#     else:
+#         logger.info("-" *100)
+#         logger.info(f'No lines in {file_name}')
+#         logger.info("-" *100)
+    
+#     return settings
 
 if __name__ == "__main__":
 
