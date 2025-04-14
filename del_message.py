@@ -27,7 +27,7 @@ DEFAULT_IMAP_SERVER = "imap.yandex.ru"
 DEFAULT_IMAP_PORT = 993
 DEFAULT_360_API_URL = "https://api360.yandex.net"
 DEFAULT_OAUTH_API_URL = "https://oauth.yandex.ru/token"
-LOG_FILE = "get_audit.log"
+LOG_FILE = "delete_messages.log"
 DEFAULT_DAYS_DIF = 1
 FILTERED_EVENTS = ["message_receive"]
 FILTERED_MAILBOXES = []
@@ -45,7 +45,7 @@ EXIT_CODE = 1
 logger = logging.getLogger("get_audit_log")
 logger.setLevel(logging.DEBUG)
 console_handler = logging.StreamHandler()
-console_handler.setLevel(logging.DEBUG)
+console_handler.setLevel(logging.INFO)
 console_handler.setFormatter(logging.Formatter('%(asctime)s.%(msecs)03d %(levelname)s:\t%(message)s', datefmt='%Y-%m-%d %H:%M:%S'))
 #file_handler = handlers.TimedRotatingFileHandler(LOG_FILE, when='D', interval=1, backupCount=30, encoding='utf-8')
 file_handler = handlers.RotatingFileHandler(LOG_FILE, maxBytes=1024 * 1024,  backupCount=5, encoding='utf-8')
@@ -139,56 +139,6 @@ def get_initials_config():
     settings.search_param = input_params
 
     return settings
-
-    days_ago = args.days_ago
-    imap_messages = {}
-    records = fetch_audit_logs(settings, days_ago=days_ago)
-    records = FilterEvents(records)
-    target_records = []
-    #print(records)
-    for user in FILTERED_MAILBOXES:
-        token = get_user_token(user, settings)
-        if token:
-            asyncio.run(get_imap_messages(user, token, days_ago, imap_messages))
-            #print(imap_messages)
-        for record in records:
-            if record["userLogin"] == user and record["msgId"]:
-                d = {}
-                d["date"] = record["date"][0:-4]
-                imap_data = imap_messages.get(record["msgId"],'')
-                if imap_data:
-                    d["from"] = imap_data['from']
-                    if imap_data['folder'] == "Trash":
-                        d["deleted"] = "Удалено"
-                    else:
-                        d["deleted"] = "Не удалено"
-                else:
-                    d["from"] = record["from"]
-                    
-                    d["deleted"] = "Удалено"
-
-                d["subject"] = record["subject"]
-                d["msgId"] = record["msgId"]
-                target_records.append(d)
-
-    last_day_of_prev_month = datetime.now().replace(day=1) - timedelta(days=1)
-    check_value = last_day_of_prev_month.strftime("%Y-%m")
-    last_month_records = []
-    for record in target_records:
-        if record["date"][:7] == check_value:
-            last_month_records.append(record)
-
-    #print(last_month_records)
-    
-    if last_month_records:
-
-        file_name = f'{settings.output_file.split(".")[0]}_{datetime.now().strftime("%y-%m-%d_%H-%M-%S")}.csv'
-        write_to_ifarma_file(last_month_records, file_name)
-
-        logger.info(f"{len(records)} audit records written to {settings.output_file}")
-
-
-    logger.info("Sript finished.")
 
 def FilterEvents(events: list) -> list:
     filtered_events = []
@@ -307,22 +257,29 @@ def WriteToFile(data, filename):
         writer.writeheader()
         writer.writerows(data)
 
-def write_to_ifarma_file(data, filename):
-    field_names = ["Дата-время", "От кого", "Тема", "Идентификатор", "Удалено да/нет"]
-    prepared_data = []
-    for entry in data:
-        prepared_data.append({
-            "Дата-время": entry["date"],
-            "От кого": entry["from"],
-            "Тема": entry["subject"],
-            "Идентификатор": entry["msgId"],
-            "Удалено да/нет": entry["deleted"]
-        })
-    with open(filename, 'w', encoding='utf-8') as csvfile:
-        writer = csv.DictWriter(csvfile, fieldnames=field_names, delimiter=';')
-
-        writer.writeheader()
-        writer.writerows(prepared_data)
+def is_valid_email(email):
+    """
+    Проверяет, является ли строка валидным email-адресом.
+    
+    Args:
+        email (str): Строка для проверки
+        
+    Returns:
+        bool: True если строка является email-адресом, иначе False
+    """
+    regex = re.compile(
+    r"(?i)"  # Case-insensitive matching
+    r"(?:[A-Z0-9!#$%&'*+/=?^_`{|}~-]+"  # Unquoted local part
+    r"(?:\.[A-Z0-9!#$%&'*+/=?^_`{|}~-]+)*"  # Dot-separated atoms in local part
+    r"|\"(?:[\x01-\x08\x0b\x0c\x0e-\x1f\x21\x23-\x5b\x5d-\x7f]"  # Quoted strings
+    r"|\\[\x01-\x09\x0b\x0c\x0e-\x7f])*\")"  # Escaped characters in local part
+    r"@"  # Separator
+    r"[A-Z0-9](?:[A-Z0-9-]*[A-Z0-9])?"  # Domain name
+    r"\.(?:[A-Z0-9](?:[A-Z0-9-]*[A-Z0-9])?)+"  # Top-level domain and subdomains
+    )
+    if re.match(regex, email):
+        return True
+    return False
 
 def is_valid_date(date_string, min_years_diff=0, max_years_diff=20):
     """
@@ -469,92 +426,88 @@ def get_user_token(user_mail: str, settings: "SettingParams"):
     response = requests.post(url=DEFAULT_OAUTH_API_URL, headers=headers, data=data)
 
     if response.status_code != HTTPStatus.OK.value:
-        logger.exception(f"Error during getiing user token: {response.status_code}")
+        logger.error(f"Error during getiing user token. Response: {response.status_code}, reason: {response.reason}, error: {response.text}")
         return ''
     else:
-        logger.info(f"User token for {user_mail} received")
+        logger.debug(f"User token for {user_mail} received")
         return response.json()["access_token"]
 
-async def get_imap_messages_and_delete(user_mail: str, token: str, settings: "SettingParams", imap_messages: dict):
+async def get_imap_messages_and_delete(user_mail: str, token: str, msg_to_search: list, imap_messages: dict):
     message_dict = {}
-    loop = asyncio.get_running_loop()
-    msg_date = datetime.datetime.strptime(settings.search_param["message_date"], "%d-%m-%Y")
-    first_date =  msg_date + relativedelta(days = -settings.search_param["days_diff"], hour = 0, minute = 0, second = 0) 
-    last_date = msg_date + relativedelta(days = settings.search_param["days_diff"]+1, hour = 0, minute = 0, second = 0)
-    search_id = f'<{settings.search_param["message_id"].replace("<", "").replace(">", "").strip()}>'
+    if not msg_to_search:
+        logger.debwg(f"No messages to search for {user_mail}")
+        return message_dict
 
-    search_criteria = f'(SINCE {first_date.strftime("%d-%b-%Y")}) BEFORE {last_date.strftime("%d-%b-%Y")}'
-    with concurrent.futures.ThreadPoolExecutor() as pool:
-        #logger.debug(f"Connect to IMAP server for {user_mail}")
-        await loop.run_in_executor(pool, log_debug, f"Connect to IMAP server for {user_mail}")
+    logger.debug(f"Connect to IMAP server for {user_mail}")
     try:
         imap_connector = aioimaplib.IMAP4_SSL(host=DEFAULT_IMAP_SERVER, port=DEFAULT_IMAP_PORT)
         await imap_connector.wait_hello_from_server()
         await imap_connector.xoauth2(user=user_mail, token=token)
-        with concurrent.futures.ThreadPoolExecutor() as pool:
-            await loop.run_in_executor(pool, log_debug, f"Connect to IMAP server for {user_mail} successful")
+        logger.debug(f"Connect to IMAP server for {user_mail} successful")
         status, folders = await imap_connector.list('""', "*")
         folders = [map_folder(folder) for folder in folders if map_folder(folder)]
         for folder in folders:
-            with concurrent.futures.ThreadPoolExecutor() as pool:
-                await loop.run_in_executor(pool, log_debug, f"Get messages from {folder}")
+            logger.debug(f"Get messages from {folder}")
             await imap_connector.select(folder)
-  
-            response = await imap_connector.search(search_criteria)
-            if response.result == 'OK':
-                if len(response.lines[0]) > 0:
-                    for num in response.lines[0].split():
-                        message_dict = {}
-                        response = await imap_connector.fetch(int(num), '(UID FLAGS BODY.PEEK[HEADER.FIELDS (%s)])' % ' '.join(ID_HEADER_SET))
-                        if response.result == 'OK':
-                            for i in range(0, len(response.lines) - 1, 3):
-                                fetch_command_without_literal = b'%s %s' % (response.lines[i], response.lines[i + 2])
+            for msg in msg_to_search:
+                msg_date = datetime.datetime.strptime(msg["message_date"], "%d-%m-%Y")
+                first_date =  msg_date + relativedelta(days = -msg["days_diff"], hour = 0, minute = 0, second = 0) 
+                last_date = msg_date + relativedelta(days = msg["days_diff"]+1, hour = 0, minute = 0, second = 0)
+                search_id = f'<{msg["message_id"].replace("<", "").replace(">", "").strip()}>'
+                search_criteria = f'(SINCE {first_date.strftime("%d-%b-%Y")}) BEFORE {last_date.strftime("%d-%b-%Y")}'
+                response = await imap_connector.search(search_criteria)
+                if response.result == 'OK':
+                    if len(response.lines[0]) > 0:
+                        for num in response.lines[0].split():
+                            message_dict = {}
+                            response = await imap_connector.fetch(int(num), '(UID FLAGS BODY.PEEK[HEADER.FIELDS (%s)])' % ' '.join(ID_HEADER_SET))
+                            if response.result == 'OK':
+                                for i in range(0, len(response.lines) - 1, 3):
+                                    fetch_command_without_literal = b'%s %s' % (response.lines[i], response.lines[i + 2])
 
-                                uid = int(FETCH_MESSAGE_DATA_UID.match(fetch_command_without_literal).group('uid'))
-                                flags = FETCH_MESSAGE_DATA_FLAGS.match(fetch_command_without_literal).group('flags')
-                                seqnum = FETCH_MESSAGE_DATA_SEQNUM.match(fetch_command_without_literal).group('seqnum')
-                                # these attributes could be used for local state management
-                                message_attrs = MessageAttributes(uid, flags, seqnum)
-                                message_dict["uid"] = uid
-                                message_dict["flags"] = flags.decode("ascii")
-                                message_dict["seqnum"] = int(seqnum.decode("ascii"))
-                                message_dict["folder"] = folder
-                                #print(message_attrs)
+                                    uid = int(FETCH_MESSAGE_DATA_UID.match(fetch_command_without_literal).group('uid'))
+                                    flags = FETCH_MESSAGE_DATA_FLAGS.match(fetch_command_without_literal).group('flags')
+                                    seqnum = FETCH_MESSAGE_DATA_SEQNUM.match(fetch_command_without_literal).group('seqnum')
+                                    # these attributes could be used for local state management
+                                    message_attrs = MessageAttributes(uid, flags, seqnum)
+                                    message_dict["uid"] = uid
+                                    message_dict["flags"] = flags.decode("ascii")
+                                    message_dict["seqnum"] = int(seqnum.decode("ascii"))
+                                    message_dict["folder"] = folder
+                                    #print(message_attrs)
 
-                                # uid fetch always includes the UID of the last message in the mailbox
-                                # cf https://tools.ietf.org/html/rfc3501#page-61
-                                message_headers = BytesHeaderParser().parsebytes(response.lines[i + 1])
-                                for header in message_headers.keys():
-                                    decoded_to_intermediate = decode_header(message_headers[header])
-                                    header_value = []
-                                    for s in decoded_to_intermediate:
-                                        if s[1] is not None:
-                                            header_value.append(s[0].decode(s[1]))
-                                        else:
-                                            if isinstance(s[0], (bytes, bytearray)):
-                                                header_value.append(s[0].decode("ascii").strip())
+                                    # uid fetch always includes the UID of the last message in the mailbox
+                                    # cf https://tools.ietf.org/html/rfc3501#page-61
+                                    message_headers = BytesHeaderParser().parsebytes(response.lines[i + 1])
+                                    for header in message_headers.keys():
+                                        decoded_to_intermediate = decode_header(message_headers[header])
+                                        header_value = []
+                                        for s in decoded_to_intermediate:
+                                            if s[1] is not None:
+                                                header_value.append(s[0].decode(s[1]))
                                             else:
-                                                header_value.append(s[0])
-                                    #with concurrent.futures.ThreadPoolExecutor() as pool:
-                                    #    await loop.run_in_executor(pool, log_debug, f'{header}: {" ".join(header_value) if len(header_value) > 1 else header_value[0]}')
-                                    #print(f'{header}: {" ".join(header_value.split()) if len(header_value) > 1 else header_value[0]}')
-                                    message_dict[header.lower()] = f'{" ".join(header_value) if len(header_value) > 1 else header_value[0]}'
-                        imap_messages[message_dict["message-id"]] = message_dict
-                        if message_dict["message-id"] == search_id:
-                            if not settings.dry_run:
-                                with concurrent.futures.ThreadPoolExecutor() as pool:
-                                    await loop.run_in_executor(pool, log_info, f"Delete message {message_dict['message-id']} in {message_dict['folder']} for {user_mail}")
-                                await imap_connector.store(int(num), "+FLAGS", "\\Deleted")
-                            else:
-                                with concurrent.futures.ThreadPoolExecutor() as pool:
-                                    await loop.run_in_executor(pool, log_info, f"DRY_RUN is TRUE: Virtually delete message {message_dict['message-id']} in {message_dict['folder']} for {user_mail}")
+                                                if isinstance(s[0], (bytes, bytearray)):
+                                                    header_value.append(s[0].decode("ascii").strip())
+                                                else:
+                                                    header_value.append(s[0])
+                                        #with concurrent.futures.ThreadPoolExecutor() as pool:
+                                        #    await loop.run_in_executor(pool, log_debug, f'{header}: {" ".join(header_value) if len(header_value) > 1 else header_value[0]}')
+                                        #print(f'{header}: {" ".join(header_value.split()) if len(header_value) > 1 else header_value[0]}')
+                                        message_dict[header.lower()] = f'{" ".join(header_value) if len(header_value) > 1 else header_value[0]}'
+                            imap_messages[message_dict["message-id"]] = message_dict
+                            if message_dict["message-id"] == search_id:
+                                if not settings.dry_run:    
+                                    logger.debug(f"Delete message {message_dict['message-id']} in {message_dict['folder']} for {user_mail}")
+                                    msg["result"] = f"Delete message {message_dict['message-id']} in {message_dict['folder']} for {user_mail}"
+                                    await imap_connector.store(int(num), "+FLAGS", "\\Deleted")
+                                else:
+                                    logger.debug(f"DRY_RUN is TRUE: Virtually delete message {message_dict['message-id']} in {message_dict['folder']} for {user_mail}")
+                                    msg["result"] = f"DRY_RUN is TRUE: Virtually delete message {message_dict['message-id']} in {message_dict['folder']} for {user_mail}"
             else:
                 continue
 
     except Exception as e:
-        with concurrent.futures.ThreadPoolExecutor() as pool:
-            await loop.run_in_executor(pool, log_debug, f"{type(e).__name__} at line {e.__traceback__.tb_lineno} of {__file__}: {e}")
-        #logger.exception(exp)       
+        logger.error(f"{type(e).__name__} at line {e.__traceback__.tb_lineno} of {__file__}: {e}")
     return imap_messages
 
 def map_folder(folder: Optional[bytes]) -> Optional[str]:
@@ -579,13 +532,12 @@ def main_menu(settings: SettingParams):
         print("Select option:")
         print("1. Enter search params manually.")
         print("2. Load search param from file.")
-        print("3. Clear search param.")
-        print("4. Start deleting messages.")
+
         # print("3. Delete all contacts.")
         # print("4. Output bad records to file")
         print("0. Exit")
 
-        choice = input("Enter your choice (0-4): ")
+        choice = input("Enter your choice (0-2): ")
 
         if choice == "0":
             print("Goodbye!")
@@ -595,11 +547,7 @@ def main_menu(settings: SettingParams):
         elif choice == "2":
             #set_days_ago(settings)
             pass
-        elif choice == "3":
-            clear_search_params(settings)
-        elif choice == "4":
-            delete_messages(settings)
-            pass
+
         else:
             print("Invalid choice. Please try again.")
     return settings
@@ -607,23 +555,29 @@ def main_menu(settings: SettingParams):
 def manually_search_params_menu(settings: SettingParams):
     while True:
         print("\n")
-        print("---------------------- Config params ----------------------")
+        print("-------------------------- Config params ---------------------------")
         print(f'Message ID: {settings.search_param["message_id"]}')
         print(f'Message date: {settings.search_param["message_date"]}')
         print(f'Days to search from message date: {settings.search_param["days_diff"]}')
         print(f'Mailboxes to search: {settings.search_param["mailboxes"]}')
         print("------------------------------------------------------------")
         print("\n")
-        print("Select option:")
-        print("1. Enter message id.")
-        print("2. Enter message date.")
+        print("---------------------- Set config params menu ----------------------")
+        print("1. Enter message id and date, separated by space.")
+        print("2. Enter message date (no more than 10 years old).")
         print("3. Enter days to search from target day (default is +-1).")
-        # print("4. Enter mailboxes to search.")
+        print("4. Enter mailboxes to search.")
+        print("5. Clear search param.")
+        print("----------------------- Delete message menu ------------------------")
+        print("8. Delete messages using audit log (mailboxes list will filled from log).")
+        print("9. Delete messages WITHOUT using audit log. (using pre-filled mailboxes list)")
+        print("------------------------ Exit to main menu -------------------------")
+
         # print("5. Clear mailboxes to search.")
 
         print("0. Exit to main menu.")
 
-        choice = input("Enter your choice (0-3): ")
+        choice = input("Enter your choice (0-9): ")
 
         if choice == "0":
             #print("Goodbye!")
@@ -641,8 +595,11 @@ def manually_search_params_menu(settings: SettingParams):
             print('\n')
             set_mailboxes(settings)
         elif choice == "5":
-            print('\n')
-            clear_mailboxes(settings)
+            clear_search_params(settings)
+        elif choice == "8":
+            delete_messages(settings)
+        elif choice == "9":
+            delete_messages(settings, use_log=False)
         else:
             print("Invalid choice. Please try again.")
     return settings
@@ -650,13 +607,25 @@ def manually_search_params_menu(settings: SettingParams):
 def set_message_id(settings: SettingParams):
     answer = input("Enter message id (space to clear): ")
     if answer:
-        settings.search_param["message_id"] = answer.replace(" ", "").strip()
+        if answer.strip() == "":
+            settings.search_param["message_id"] = ""
+            return settings
+        if len(answer.strip().split(" ")) == 2:
+            settings.search_param["message_id"] = answer.split()[0]
+            set_message_date(settings, input_date = answer.split()[1])
+        elif len(answer.strip().split(" ")) == 1:
+            settings.search_param["message_id"] = answer.replace(" ", "").strip()
+        else:
+            print("Invalid input (string with spaces). Please try again.")
     return settings
 
-def set_message_date(settings: SettingParams):
-    answer = input("Enter message date DD-MM-YYYY (space to clear): ")
+def set_message_date(settings: SettingParams, input_date: str = ""):
+    if not input_date:
+        answer = input("Enter message date DD-MM-YYYY (space to clear): ")
+    else:
+        answer = input_date
     if answer.replace(" ", "").strip():
-        status, date = is_valid_date(answer.replace(" ", "").strip(), min_years_diff=0, max_years_diff=20)
+        status, date = is_valid_date(answer.replace(" ", "").strip(), min_years_diff=0, max_years_diff=10)
         if status:
             now = datetime.datetime.now().date()
             if date > now:
@@ -683,14 +652,21 @@ def set_days_diff(settings: SettingParams):
     return settings
 
 def set_mailboxes(settings: SettingParams):
-    answer = input("Enter several mailboxes to search (alias@domain.com), sparated by comma or semicolon:\n")
+    answer = input("Enter several mailboxes to search (alias@domain.com), separated by comma or semicolon (space to clear list):\n")
     if answer:
+        if answer.strip() == "":
+            settings.search_param["mailboxes"] = []
+            return settings
+        
         manually_list = answer.replace(",", ";").split(";")
         if len(manually_list) > 0:
-            settings.search_param["mailboxes"].clear()
+            #settings.search_param["mailboxes"].clear()
             for manual in manually_list:
-                if manual not in settings.search_param["mailboxes"]:
-                    settings.search_param["mailboxes"].append(manual.strip())
+                if is_valid_email(manual.strip()):
+                    if manual not in settings.search_param["mailboxes"]:
+                        settings.search_param["mailboxes"].append(manual.strip())
+                else:
+                    print(f"Invalid email address {manual}.")
         return settings
     
 def clear_mailboxes(settings: SettingParams):
@@ -710,7 +686,7 @@ def clear_search_params(settings: SettingParams):
     settings.search_param["days_diff"] = 1
     return settings
 
-def delete_messages(settings: SettingParams):
+def delete_messages(settings: SettingParams, use_log=True):
     stop_running = False
     if not settings.search_param["message_id"]:
         logger.error("Message ID is empty.")
@@ -724,21 +700,24 @@ def delete_messages(settings: SettingParams):
         now = datetime.datetime.now().date()
         diff = now - date
         if diff.days > 90 and not settings.search_param["mailboxes"]:
-            logger.error("Message date is too old. Can not get mailboxes to search from audit log.")
+            logger.error("Message date is too old. Can not get mailboxes to search from audit log. Fill list of mailboxes manually.")
             stop_running = True
+        elif diff.days > 90:
+            use_log = False
     
     if stop_running:
         return settings
     
     search_ids = [f"<{settings.search_param["message_id"].replace("<", "").replace(">", ",").strip()}>"]
-    if not settings.search_param["mailboxes"]:
+    if use_log:
         logger.info("Start searching mailboxes from audit log.")
         records = fetch_audit_logs(settings)
         logger.info("End searching mailboxes from audit log.")
         for r in records:
             if r["msgId"] in search_ids:
                 logger.info(f'Found mailbox {r["userLogin"]} for message {r["msgId"]}')
-                settings.search_param["mailboxes"].append(r["userLogin"])
+                if r["userLogin"] not in settings.search_param["mailboxes"]:
+                    settings.search_param["mailboxes"].append(r["userLogin"])
 
     if not settings.search_param["mailboxes"]:
         logger.error(f"No mailboxes was found for message {settings.search_param["message_id"]} from search in audit log.")
@@ -746,10 +725,20 @@ def delete_messages(settings: SettingParams):
     
     imap_messages = {}
     for user in settings.search_param["mailboxes"]:
+        search_msg = []
+        msg = {}
+        msg["message_id"] = settings.search_param["message_id"]
+        msg["message_date"] = settings.search_param["message_date"]
+        msg["days_diff"] = settings.search_param["days_diff"]
+        msg["mailbox"] = user
+        msg["result"] = f"Message {settings.search_param["message_id"]} - can not get token for {user} mailbox. Check email or service app settings."
+        search_msg.append(msg)
         token = get_user_token(user, settings)
         if token:
-            asyncio.run(get_imap_messages_and_delete(user, token, settings, imap_messages ))
-            #print(imap_messages)
+            msg["result"] = f"Message {settings.search_param["message_id"]} not found in {user} mailbox. See log for details."
+            asyncio.run(get_imap_messages_and_delete(user, token, search_msg, imap_messages ))
+        for msg in search_msg:
+            logger.info(msg["result"])
 
     return settings
     
