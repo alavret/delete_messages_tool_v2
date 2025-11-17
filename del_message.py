@@ -708,7 +708,7 @@ def delete_messages(settings: SettingParams, use_log=True):
     if stop_running:
         return settings
     
-    search_ids = [f"<{settings.search_param["message_id"].replace("<", "").replace(">", ",").strip()}>"]
+    search_ids = [f"<{settings.search_param["message_id"].replace("<", "").replace(">", "").strip()}>"]
     if use_log:
         logger.info("Start searching mailboxes from audit log.")
         records = fetch_audit_logs(settings)
