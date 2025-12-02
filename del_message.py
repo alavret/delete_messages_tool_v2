@@ -22,6 +22,7 @@ import concurrent.futures
 import aioimaplib
 from typing import Optional
 import time
+import json
 
 
 DEFAULT_IMAP_SERVER = "imap.yandex.ru"
@@ -36,6 +37,14 @@ ALL_USERS_REFRESH_IN_MINUTES = 5
 USERS_PER_PAGE_FROM_API = 100
 MAX_RETRIES = 3
 RETRIES_DELAY_SEC = 2
+# Количество страниц для запроса логов последовательно в одном цикле последовательного обращения к API, после чего формируется новый набор стартовой и конечных дат
+OLD_LOG_MAX_PAGES = 10
+
+# На сколько секунд сдвигается назад стартовыя дата запроса логов между последовательными обращениями к API (чтобы не потерять записи)
+OVERLAPPED_SECONDS = 2
+
+# !!! Don't modify MAIL_LOGS_MAX_RECORDS value !!!
+MAIL_LOGS_MAX_RECORDS = 100
 
 
 ID_HEADER_SET = {'Content-Type', 'From', 'To', 'Cc', 'Bcc', 'Date', 'Subject',
