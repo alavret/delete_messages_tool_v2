@@ -21,6 +21,7 @@ import asyncio
 import concurrent.futures
 import aioimaplib
 from typing import Optional
+import time
 
 
 DEFAULT_IMAP_SERVER = "imap.yandex.ru"
@@ -31,6 +32,10 @@ LOG_FILE = "delete_messages.log"
 DEFAULT_DAYS_DIF = 1
 FILTERED_EVENTS = ["message_receive"]
 FILTERED_MAILBOXES = []
+ALL_USERS_REFRESH_IN_MINUTES = 5
+USERS_PER_PAGE_FROM_API = 100
+MAX_RETRIES = 3
+RETRIES_DELAY_SEC = 2
 
 
 ID_HEADER_SET = {'Content-Type', 'From', 'To', 'Cc', 'Bcc', 'Date', 'Subject',
@@ -127,6 +132,7 @@ def get_initials_config():
     input_params["message_date"] = ""
     input_params["events"] = FILTERED_EVENTS
     input_params["mailboxes"] = FILTERED_MAILBOXES
+    input_params["is_all_mailboxes"] = False
 
     if args.id is not None: 
         input_params["message_id"] = args.id
@@ -147,6 +153,64 @@ def FilterEvents(events: list) -> list:
             filtered_events.append(event)
     return filtered_events
 
+def get_all_api360_users(settings: "SettingParams", force = False):
+    if not force:
+        logger.info("Получение всех пользователей организации из кэша...")
+
+    if not settings.all_users or force or (datetime.datetime.now() - settings.all_users_get_timestamp).total_seconds() > ALL_USERS_REFRESH_IN_MINUTES * 60:
+        #logger.info("Получение всех пользователей организации из API...")
+        settings.all_users = get_all_api360_users_from_api(settings)
+        settings.all_users_get_timestamp = datetime.datetime.now()
+    return settings.all_users
+
+def get_all_api360_users_from_api(settings: "SettingParams"):
+    logger.info("Получение всех пользователей организации из API...")
+    url = f"{DEFAULT_360_API_URL}/directory/v1/org/{settings.organization_id}/users"
+    headers = {"Authorization": f"OAuth {settings.oauth_token}"}
+    has_errors = False
+    users = []
+    current_page = 1
+    last_page = 1
+    while current_page <= last_page:
+        params = {'page': current_page, 'perPage': USERS_PER_PAGE_FROM_API}
+        try:
+            retries = 1
+            while True:
+                logger.debug(f"GET URL - {url}")
+                response = requests.get(url, headers=headers, params=params)
+                logger.debug(f"x-request-id: {response.headers.get('x-request-id','')}")
+                if response.status_code != HTTPStatus.OK.value:
+                    logger.error(f"!!! ОШИБКА !!! при GET запросе url - {url}: {response.status_code}. Сообщение об ошибке: {response.text}")
+                    if retries < MAX_RETRIES:
+                        logger.error(f"Повторная попытка ({retries+1}/{MAX_RETRIES})")
+                        time.sleep(RETRIES_DELAY_SEC * retries)
+                        retries += 1
+                    else:
+                        has_errors = True
+                        break
+                else:
+                    for user in response.json()['users']:
+                        if not user.get('isRobot') and int(user["id"]) >= 1130000000000000:
+                            users.append(user)
+                    logger.debug(f"Загружено {len(response.json()['users'])} пользователей. Текущая страница - {current_page} (всего {last_page} страниц).")
+                    current_page += 1
+                    last_page = response.json()['pages']
+                    break
+
+        except requests.exceptions.RequestException as e:
+            logger.error(f"!!! ERROR !!! {type(e).__name__} at line {e.__traceback__.tb_lineno} of {__file__}: {e}")
+            has_errors = True
+            break
+
+        if has_errors:
+            break
+
+    if has_errors:
+        print("Есть ошибки при GET запросах. Возвращается пустой список пользователей.")
+        return []
+    
+    return users
+
 @dataclass
 class SettingParams:
     oauth_token: str
@@ -157,6 +221,8 @@ class SettingParams:
     application_client_secret: str
     dry_run: bool
     search_param : dict
+    all_users : list
+    all_users_get_timestamp : datetime
 
 def get_settings():
     settings = SettingParams (
@@ -167,7 +233,9 @@ def get_settings():
         message_id_file_name = os.environ.get("MESSAGE_ID_FILE_NAME"),
         mailboxes_to_search_file_name = os.environ.get("MAILBOXES_TO_SEARCH_FILE_NAME"),
         dry_run = False,
-        search_param = {}
+        search_param = {},
+        all_users = [],
+        all_users_get_timestamp = datetime.datetime.now(),
     )
 
     exit_flag = False
@@ -249,6 +317,84 @@ def fetch_audit_logs(settings: "SettingParams"):
             return
         
     return log_records
+
+def fetch_audit_logs2(settings: "SettingParams"):
+  
+    log_records = set()
+    params = {}
+    error = False
+    msg_date = datetime.strptime(settings.search_param["message_date"], "%d-%m-%Y")
+
+    initial_after_date =  msg_date + relativedelta(days = -settings.search_param["days_diff"], hour = 0, minute = 0, second = 0) 
+    initial_before_date = msg_date + relativedelta(days = settings.search_param["days_diff"]+1, hour = 0, minute = 0, second = 0)
+    logger.info(f"Search data from {initial_after_date.strftime('%Y-%m-%d')} to {initial_before_date.strftime('%Y-%m-%d')}.")
+    ended_at = initial_before_date.strftime("%Y-%m-%dT%H:%M:%SZ")
+    last_date = initial_after_date.strftime("%Y-%m-%dT%H:%M:%SZ")
+    try:
+        params["pageSize"] = MAIL_LOGS_MAX_RECORDS
+        if last_date:
+            params["afterDate"] = last_date
+        if ended_at:
+            msg_date = datetime.strptime(ended_at, "%Y-%m-%dT%H:%M:%SZ")
+            shifted_date = msg_date + relativedelta(seconds=OVERLAPPED_SECONDS)
+            params["beforeDate"] = shifted_date.strftime("%Y-%m-%dT%H:%M:%SZ")
+        url = f"{DEFAULT_360_API_URL}/security/v1/org/{settings.organization_id}/audit_log/mail"
+        headers = {"Authorization": f"OAuth {settings.oauth_token}"}
+        pages_count = 0
+        retries = 0
+        while True:           
+            response = requests.get(url, headers=headers, params=params)
+            if response.status_code != HTTPStatus.OK.value:
+                logger.error(f"Error during GET request: {response.status_code}. Error message: {response.text}")
+                logger.debug(f"Error during GET request. url - {url}. Params - {params}")
+                logger.debug(f'X-Request-Id: {response.headers.get("X-Request-Id","")}')
+                if retries < MAX_RETRIES:
+                    logger.error(f"Retrying ({retries+1}/{MAX_RETRIES})")
+                    time.sleep(RETRIES_DELAY_SEC * retries)
+                    retries += 1
+                else:
+                    logger.error("Forcing exit without getting data.")
+                    error = True
+                    return []
+            else:
+                retries = 1
+                temp_list = response.json()["events"]
+                if not temp_list:
+                    logger.error("GET request returned empty response. Exit from log gathering cycle.")
+                    break
+                sorted_list = sorted(temp_list, key=lambda x: x["date"], reverse=True)
+                if temp_list:
+                    logger.debug(f'Received {len(sorted_list)} records, from {sorted_list[-1]["date"]} to {sorted_list[0]["date"]}')
+                    temp_json = [json.dumps(d, ensure_ascii=False).encode('utf8') for d in sorted_list]
+                    log_records.update(temp_json)
+                
+                if response.json()["nextPageToken"] == "":
+                    break
+                else:
+                    if pages_count < OLD_LOG_MAX_PAGES:
+                        pages_count += 1
+                        params["pageToken"] = response.json()["nextPageToken"]
+                    else:
+                        if params.get('pageToken') : del params['pageToken']
+                        if temp_list:
+                            sugested_date = sorted_list[-1]["date"][0:19] + "Z"
+                            msg_date = datetime.strptime(sugested_date, "%Y-%m-%dT%H:%M:%SZ")
+                            shifted_date = msg_date + relativedelta(seconds=OVERLAPPED_SECONDS)
+                            params["beforeDate"] = shifted_date.strftime("%Y-%m-%dT%H:%M:%SZ")
+                        else:
+                            logger.error("No data returned from API request. Exit from cycle.")
+                            logger.debug(f"Data for GET request: url - {url}. Params - {params}")
+                            logger.debug(f'X-Request-Id: {response.headers.get("X-Request-Id","")}')
+                            break
+                        params["pageSize"] = 100
+                        pages_count = 0
+
+    except Exception as e:
+        logger.error(f"{type(e).__name__} at line {e.__traceback__.tb_lineno} of {__file__}: {e}")
+        error = True
+        return []
+        
+    return error, list(log_records)
 
 def WriteToFile(data, filename):
     with open(filename, 'w', encoding='utf-8') as csvfile:
@@ -507,7 +653,10 @@ async def get_imap_messages_and_delete(user_mail: str, token: str, msg_to_search
                 continue
 
     except Exception as e:
-        logger.error(f"{type(e).__name__} at line {e.__traceback__.tb_lineno} of {__file__}: {e}")
+        if "command LIST illegal in state NONAUTH" in str(e):
+            logger.error(f"!!! ERRROR: Command LIST illegal in state NONAUTH for {user_mail}. Usually, this means that the user's mailbox is not initialized (user is not logged in yet). !!!")
+        else:
+            logger.error(f"{type(e).__name__} at line {e.__traceback__.tb_lineno} of {__file__}: {e}")
     return imap_messages
 
 def map_folder(folder: Optional[bytes]) -> Optional[str]:
@@ -526,7 +675,8 @@ def main_menu(settings: SettingParams):
         print(f'Message ID: {settings.search_param["message_id"]}')
         print(f'Message date: {settings.search_param["message_date"]}')
         print(f'Days to search from message date: {settings.search_param["days_diff"]}')
-        print(f'Mailboxes to search: {settings.search_param["mailboxes"]}')
+        mailboxes_display = "All mailboxes" if settings.search_param.get("is_all_mailboxes", False) else settings.search_param["mailboxes"]
+        print(f'Mailboxes to search: {mailboxes_display}')
         print("------------------------------------------------------------")
         print("\n")
         print("Select option:")
@@ -559,7 +709,8 @@ def manually_search_params_menu(settings: SettingParams):
         print(f'Message ID: {settings.search_param["message_id"]}')
         print(f'Message date: {settings.search_param["message_date"]}')
         print(f'Days to search from message date: {settings.search_param["days_diff"]}')
-        print(f'Mailboxes to search: {settings.search_param["mailboxes"]}')
+        mailboxes_display = "All mailboxes" if settings.search_param.get("is_all_mailboxes", False) else settings.search_param["mailboxes"]
+        print(f'Mailboxes to search: {mailboxes_display}')
         print("------------------------------------------------------------")
         print("\n")
         print("---------------------- Set config params menu ----------------------")
@@ -652,14 +803,32 @@ def set_days_diff(settings: SettingParams):
     return settings
 
 def set_mailboxes(settings: SettingParams):
-    answer = input("Enter several mailboxes to search (alias@domain.com), separated by comma or semicolon (space to clear list):\n")
+    answer = input("Enter several mailboxes to search (alias@domain.com), separated by comma or semicolon (space to clear list, * for all users):\n")
     if answer:
         if answer.strip() == "":
             settings.search_param["mailboxes"] = []
+            settings.search_param["is_all_mailboxes"] = False
+            return settings
+        
+        # Check if user wants all mailboxes
+        if answer.strip() == "*":
+            logger.info("Получение списка всех пользователей из Яндекс 360...")
+            all_users = get_all_api360_users(settings, force=False)
+            if all_users:
+                settings.search_param["mailboxes"] = []
+                for user in all_users:
+                    if user.get("email"):
+                        settings.search_param["mailboxes"].append(user["email"])
+                settings.search_param["is_all_mailboxes"] = True
+                logger.info(f"Добавлено {len(settings.search_param['mailboxes'])} почтовых ящиков")
+            else:
+                logger.error("Не удалось получить список пользователей из Яндекс 360")
+                settings.search_param["is_all_mailboxes"] = False
             return settings
         
         manually_list = answer.replace(",", ";").split(";")
         if len(manually_list) > 0:
+            settings.search_param["is_all_mailboxes"] = False
             #settings.search_param["mailboxes"].clear()
             for manual in manually_list:
                 if is_valid_email(manual.strip()):
@@ -674,6 +843,7 @@ def clear_mailboxes(settings: SettingParams):
     if answer.upper() not in ["Y", "YES"]:
         return settings
     settings.search_param["mailboxes"] = []
+    settings.search_param["is_all_mailboxes"] = False
     return settings
 
 def clear_search_params(settings: SettingParams):
@@ -681,6 +851,7 @@ def clear_search_params(settings: SettingParams):
     if answer.upper() not in ["Y", "YES"]:
         return settings
     settings.search_param["mailboxes"] = []
+    settings.search_param["is_all_mailboxes"] = False
     settings.search_param["message_id"] = ""
     settings.search_param["message_date"] = ""
     settings.search_param["days_diff"] = 1
@@ -711,7 +882,10 @@ def delete_messages(settings: SettingParams, use_log=True):
     search_ids = [f"<{settings.search_param["message_id"].replace("<", "").replace(">", "").strip()}>"]
     if use_log:
         logger.info("Start searching mailboxes from audit log.")
-        records = fetch_audit_logs(settings)
+        error, records = fetch_audit_logs2(settings)
+        if error:
+            logger.error(f"Error fetching audit logs: {error}")
+            return settings
         logger.info("End searching mailboxes from audit log.")
         for r in records:
             if r["msgId"] in search_ids:
