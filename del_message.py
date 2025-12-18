@@ -56,6 +56,11 @@ MessageAttributes = namedtuple('MessageAttributes', 'uid flags sequence_number')
 
 EXIT_CODE = 1
 
+NEEDED_PERMISSIONS = [
+    "directory:read_users",
+    "ya360_security:audit_log_mail",
+]
+
 logger = logging.getLogger("get_audit_log")
 logger.setLevel(logging.DEBUG)
 console_handler = logging.StreamHandler()
@@ -234,6 +239,7 @@ class SettingParams:
     all_users_get_timestamp : datetime
 
 def get_settings():
+    oauth_token_bad = False
     settings = SettingParams (
         oauth_token = os.environ.get("OAUTH_TOKEN_ARG"),
         organization_id = int(os.environ.get("ORGANIZATION_ID_ARG")),
@@ -241,7 +247,7 @@ def get_settings():
         application_client_secret = os.environ.get("APPLICATION_CLIENT_SECRET_ARG"),
         message_id_file_name = os.environ.get("MESSAGE_ID_FILE_NAME"),
         mailboxes_to_search_file_name = os.environ.get("MAILBOXES_TO_SEARCH_FILE_NAME"),
-        dry_run = False,
+        dry_run = os.environ.get("DRY_RUN", "false").lower() == "true",
         search_param = {},
         all_users = [],
         all_users_get_timestamp = datetime.datetime.now(),
@@ -256,6 +262,16 @@ def get_settings():
         logger.error("ORGANIZATION_ID_ARG is not set")
         exit_flag = True
 
+    if not (oauth_token_bad or exit_flag):
+        hard_error, result_ok = check_token_permissions(settings.oauth_token, settings.organization_id, NEEDED_PERMISSIONS)
+        if hard_error:
+            logger.error("OAUTH_TOKEN не является действительным или не имеет необходимых прав доступа")
+            oauth_token_bad = True
+        elif not result_ok:
+            print("ВНИМАНИЕ: Функциональность скрипта может быть ограничена. Возможны ошибки при работе с API.")
+            print("=" * 100)
+            input("Нажмите Enter для продолжения..")
+
     if not settings.application_client_id:
         logger.error("APPLICATION_CLIENT_ID_ARG is not set")
         exit_flag = True
@@ -264,28 +280,110 @@ def get_settings():
         logger.error("APPLICATION_CLIENT_SECRET_ARG is not set")
         exit_flag = True
 
-    if os.environ.get("DRY_RUN"):
-        if os.environ.get("DRY_RUN").lower() == "true":
-            settings.dry_run = True
-        elif os.environ.get("DRY_RUN").lower() == "false":
-            settings.dry_run = False
-        else:
-            logger.error("DRY_RUN must be true or false")
-            exit_flag = True
-    else:
-        settings.dry_run = False
+    if oauth_token_bad:
+        exit_flag = True
 
     if exit_flag:
         return None
     
     return settings
 
+def check_oauth_token(oauth_token, org_id):
+    """Проверяет, что токен OAuth действителен."""
+    url = f'{DEFAULT_360_API_URL}/directory/v1/org/{org_id}/users?perPage=100'
+    headers = {
+        'Authorization': f'OAuth {oauth_token}'
+    }
+    response = requests.get(url, headers=headers)
+    if response.status_code == HTTPStatus.OK:
+        return True
+    return False
+
+
+def check_token_permissions(token: str, org_id: int, needed_permissions: list) -> bool:
+    """
+    Проверяет права доступа для заданного токена.
+    
+    Args:
+        token: OAuth токен для проверки
+        org_id: ID организации
+        needed_permissions: Список необходимых прав доступа
+        
+    Returns:
+        bool: True если токен невалидный, False в противном случае, продолжение работы невозможно
+        bool: True если все права присутствуют и org_id совпадает, False в противном случае, продолжение работы возможно
+    """
+    url = 'https://api360.yandex.net/whoami'
+    headers = {
+        'Authorization': f'OAuth {token}'
+    }
+    hard_error = False
+    try:
+        response = requests.get(url, headers=headers)
+        
+        # Проверка валидности токена
+        if response.status_code != HTTPStatus.OK:
+            logger.error(f"Невалидный токен. Статус код: {response.status_code}")
+            if response.status_code == 401:
+                logger.error("Токен недействителен или истек срок его действия.")
+            else:
+                logger.error(f"Ошибка при проверке токена: {response.text}")
+            return True, False
+        
+        data = response.json()
+        
+        # Извлечение scopes и orgIds из ответа
+        token_scopes = data.get('scopes', [])
+        token_org_ids = data.get('orgIds', [])
+        login = data.get('login', 'unknown')
+        
+        logger.info(f"Проверка прав доступа для токена пользователя: {login}")
+        logger.debug(f"Доступные права: {token_scopes}")
+        logger.debug(f"Доступные организации: {token_org_ids}")
+        
+        # Проверка наличия org_id в списке доступных организаций
+        if str(org_id) not in [str(org) for org in token_org_ids]:
+            logger.error("=" * 100)
+            logger.error(f"ОШИБКА: Токен не имеет доступа к организации с ID {org_id}")
+            logger.error(f"Доступные организации для этого токена: {token_org_ids}")
+            logger.error("=" * 100)
+            return True, False
+
+        # Проверка наличия всех необходимых прав
+        missing_permissions = []
+        for permission in needed_permissions:
+            if permission not in token_scopes:
+                missing_permissions.append(permission)
+        
+        if missing_permissions:
+            logger.error("=" * 100)
+            logger.error("ОШИБКА: У токена отсутствуют необходимые права доступа!")
+            logger.error("Недостающие права:")
+            for perm in missing_permissions:
+                logger.error(f"  - {perm}")
+            logger.error("=" * 100)
+            return False, False
+
+        logger.info("✓ Все необходимые права доступа присутствуют")
+        logger.info(f"✓ Доступ к организации {org_id} подтвержден")
+        return False, True
+        
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Ошибка при выполнении запроса к API: {e}")
+        return True, False
+    except json.JSONDecodeError as e:
+        logger.error(f"Ошибка при парсинге ответа от API: {e}")
+        return True, False
+    except Exception as e:
+        logger.error(f"Неожиданная ошибка при проверке прав доступа: {type(e).__name__}: {e}")
+        return True, False
+
 def fetch_audit_logs(settings: "SettingParams"):
     msg_date = datetime.datetime.strptime(settings.search_param["message_date"], "%d-%m-%Y")
 
     first_date =  msg_date + relativedelta(days = -settings.search_param["days_diff"], hour = 0, minute = 0, second = 0) 
     last_date = msg_date + relativedelta(days = settings.search_param["days_diff"]+1, hour = 0, minute = 0, second = 0)
-    logger.info(f"Search data from {first_date.strftime("%Y-%m-%d")} to {last_date.strftime("%Y-%m-%d")}.")
+    logger.info(f"Search data from {first_date.strftime('%Y-%m-%d')} to {last_date.strftime('%Y-%m-%d')}.")
     final_first_date = first_date.strftime("%Y-%m-%dT%H:%M:%SZ")
     final_last_date = last_date.strftime("%Y-%m-%dT%H:%M:%SZ")
     #day_last_check = (datetime.now().replace(hour=0, minute=0, second=0) - timedelta(days=days_ago)).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -332,7 +430,7 @@ def fetch_audit_logs2(settings: "SettingParams"):
     log_records = set()
     params = {}
     error = False
-    msg_date = datetime.strptime(settings.search_param["message_date"], "%d-%m-%Y")
+    msg_date = datetime.datetime.strptime(settings.search_param["message_date"], "%d-%m-%Y")
 
     initial_after_date =  msg_date + relativedelta(days = -settings.search_param["days_diff"], hour = 0, minute = 0, second = 0) 
     initial_before_date = msg_date + relativedelta(days = settings.search_param["days_diff"]+1, hour = 0, minute = 0, second = 0)
@@ -344,7 +442,7 @@ def fetch_audit_logs2(settings: "SettingParams"):
         if last_date:
             params["afterDate"] = last_date
         if ended_at:
-            msg_date = datetime.strptime(ended_at, "%Y-%m-%dT%H:%M:%SZ")
+            msg_date = datetime.datetime.strptime(ended_at, "%Y-%m-%dT%H:%M:%SZ")
             shifted_date = msg_date + relativedelta(seconds=OVERLAPPED_SECONDS)
             params["beforeDate"] = shifted_date.strftime("%Y-%m-%dT%H:%M:%SZ")
         url = f"{DEFAULT_360_API_URL}/security/v1/org/{settings.organization_id}/audit_log/mail"
@@ -387,7 +485,7 @@ def fetch_audit_logs2(settings: "SettingParams"):
                         if params.get('pageToken') : del params['pageToken']
                         if temp_list:
                             sugested_date = sorted_list[-1]["date"][0:19] + "Z"
-                            msg_date = datetime.strptime(sugested_date, "%Y-%m-%dT%H:%M:%SZ")
+                            msg_date = datetime.datetime.strptime(sugested_date, "%Y-%m-%dT%H:%M:%SZ")
                             shifted_date = msg_date + relativedelta(seconds=OVERLAPPED_SECONDS)
                             params["beforeDate"] = shifted_date.strftime("%Y-%m-%dT%H:%M:%SZ")
                         else:
@@ -663,7 +761,8 @@ async def get_imap_messages_and_delete(user_mail: str, token: str, msg_to_search
 
     except Exception as e:
         if "command LIST illegal in state NONAUTH" in str(e):
-            logger.error(f"!!! ERRROR: Command LIST illegal in state NONAUTH for {user_mail}. Usually, this means that the user's mailbox is not initialized (user is not logged in yet). !!!")
+            logger.error(f"!!! ERRROR: Command LIST illegal in state NONAUTH for {user_mail}.")
+            logger.error("Как правило, это означает, что почтовый ящик пользователя не инициализирован (пользователь ещё не входил в почтовый клиент).")
         else:
             logger.error(f"{type(e).__name__} at line {e.__traceback__.tb_lineno} of {__file__}: {e}")
     return imap_messages
@@ -897,7 +996,20 @@ def delete_messages(settings: SettingParams, use_log=True):
             return settings
         logger.info("End searching mailboxes from audit log.")
         for r in records:
-            if r["msgId"] in search_ids:
+            try:
+                if isinstance(r, (bytes, bytearray)):
+                    r = json.loads(r.decode("utf-8"))
+                elif isinstance(r, str):
+                    r = json.loads(r)
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                logger.error(f"Error decoding audit log record: {exc}")
+                continue
+
+            if not isinstance(r, dict):
+                logger.error("Audit log record has unexpected format.")
+                continue
+
+            if r.get("msgId") in search_ids:
                 logger.info(f'Found mailbox {r["userLogin"]} for message {r["msgId"]}')
                 if r["userLogin"] not in settings.search_param["mailboxes"]:
                     settings.search_param["mailboxes"].append(r["userLogin"])
