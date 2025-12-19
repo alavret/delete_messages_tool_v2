@@ -1088,7 +1088,7 @@ def delete_messages(settings: SettingParams, use_log=True):
         msg["message_date"] = settings.search_param["message_date"]
         msg["days_diff"] = settings.search_param["days_diff"]
         msg["mailbox"] = user
-        msg["result"] = f"Message {settings.search_param["message_id"]} - can not get token for {user} mailbox. Check email or service app settings."
+        msg["result"] = f'Message {settings.search_param["message_id"]} - can not get token for {user} mailbox. Check email or service app settings.'
         search_msg.append(msg)
         token = get_user_token(user, settings)
         if token:
