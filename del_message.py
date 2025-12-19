@@ -1077,7 +1077,7 @@ def delete_messages(settings: SettingParams, use_log=True):
                     settings.search_param["mailboxes"].append(r["userLogin"])
 
     if not settings.search_param["mailboxes"]:
-        logger.error(f"No mailboxes was found for message {settings.search_param["message_id"]} from search in audit log.")
+        logger.error(f'No mailboxes was found for message {settings.search_param["message_id"]} from search in audit log.')
         return settings
     
     imap_messages = {}
