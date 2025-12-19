@@ -13,11 +13,11 @@ import csv
 from dataclasses import dataclass
 from textwrap import dedent
 from http import HTTPStatus
-from asyncio import run, wait_for
 from collections import namedtuple
 from email.parser import BytesHeaderParser, BytesParser
 from email.header import decode_header
 import asyncio
+import atexit
 import concurrent.futures
 import aioimaplib
 from typing import Optional
@@ -35,7 +35,7 @@ FILTERED_EVENTS = ["message_receive"]
 FILTERED_MAILBOXES = []
 ALL_USERS_REFRESH_IN_MINUTES = 5
 USERS_PER_PAGE_FROM_API = 100
-MAX_RETRIES = 3
+MAX_RETRIES = 1
 RETRIES_DELAY_SEC = 2
 # Количество страниц для запроса логов последовательно в одном цикле последовательного обращения к API, после чего формируется новый набор стартовой и конечных дат
 OLD_LOG_MAX_PAGES = 10
@@ -72,6 +72,36 @@ file_handler.setLevel(logging.DEBUG)
 file_handler.setFormatter(logging.Formatter('%(asctime)s.%(msecs)03d %(levelname)s:\t%(message)s', datefmt='%Y-%m-%d %H:%M:%S'))
 logger.addHandler(console_handler)
 logger.addHandler(file_handler)
+
+_event_loop: Optional[asyncio.AbstractEventLoop] = None
+
+
+def get_or_create_event_loop() -> asyncio.AbstractEventLoop:
+    """
+    Ensure we always use a live event loop.
+    On some systems asyncio.run() closing the loop after each call leads to
+    "Event loop is closed" when next IMAP connection tries to schedule work.
+    We reuse one loop for all async IMAP calls and close it at exit.
+    """
+    global _event_loop
+    try:
+        return asyncio.get_running_loop()
+    except RuntimeError:
+        pass
+
+    if _event_loop is None or _event_loop.is_closed():
+        _event_loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(_event_loop)
+    return _event_loop
+
+
+def _close_event_loop() -> None:
+    global _event_loop
+    if _event_loop and not _event_loop.is_closed():
+        _event_loop.close()
+
+
+atexit.register(_close_event_loop)
 
 def arg_parser():
     parser = argparse.ArgumentParser(
@@ -682,20 +712,46 @@ def get_user_token(user_mail: str, settings: "SettingParams"):
         logger.error(f"Error during getiing user token. Response: {response.status_code}, reason: {response.reason}, error: {response.text}")
         return ''
     else:
-        logger.debug(f"User token for {user_mail} received")
+        logger.debug(f"User token for {user_mail} received successfully - {response.json()['access_token']}")
         return response.json()["access_token"]
 
 async def get_imap_messages_and_delete(user_mail: str, token: str, msg_to_search: list, imap_messages: dict):
     message_dict = {}
     if not msg_to_search:
-        logger.debwg(f"No messages to search for {user_mail}")
+        logger.debug(f"No messages to search for {user_mail}")
         return message_dict
 
     logger.debug(f"Connect to IMAP server for {user_mail}")
+    imap_connector = None
     try:
-        imap_connector = aioimaplib.IMAP4_SSL(host=DEFAULT_IMAP_SERVER, port=DEFAULT_IMAP_PORT)
-        await imap_connector.wait_hello_from_server()
-        await imap_connector.xoauth2(user=user_mail, token=token)
+        connection_established = False
+        for attempt in range(1, MAX_RETRIES + 1):
+            try:
+                imap_connector = aioimaplib.IMAP4_SSL(host=DEFAULT_IMAP_SERVER, port=DEFAULT_IMAP_PORT)
+                await imap_connector.wait_hello_from_server()
+                auth_response = await imap_connector.xoauth2(user=user_mail, token=token)
+                if auth_response.result == 'OK':
+                    connection_established = True
+                    break
+                logger.debug(f"IMAP auth failed for {user_mail}: {auth_response.result} {auth_response.lines}")
+                for msg in msg_to_search:
+                    msg["result"] = f"IMAP auth failed for {user_mail}: {auth_response.result}. See log for details."
+            except Exception as connect_error:
+                logger.debug(f"IMAP connect attempt {attempt} failed for {user_mail}: {connect_error}")
+                for msg in msg_to_search:
+                    msg["result"] = f"IMAP connect attempt {attempt} failed for {user_mail}. See log for details."
+            if imap_connector:
+                try:
+                    await imap_connector.logout()
+                except Exception:
+                    pass
+                imap_connector = None
+            if attempt < MAX_RETRIES:
+                delay_seconds = RETRIES_DELAY_SEC * attempt
+                logger.debug(f"Retry IMAP connect for {user_mail} in {delay_seconds} seconds (attempt {attempt + 1}/{MAX_RETRIES})")
+                await asyncio.sleep(delay_seconds)
+        if not connection_established:
+            return imap_messages
         logger.debug(f"Connect to IMAP server for {user_mail} successful")
         status, folders = await imap_connector.list('""', "*")
         folders = [map_folder(folder) for folder in folders if map_folder(folder)]
@@ -765,6 +821,12 @@ async def get_imap_messages_and_delete(user_mail: str, token: str, msg_to_search
             logger.error("Как правило, это означает, что почтовый ящик пользователя не инициализирован (пользователь ещё не входил в почтовый клиент).")
         else:
             logger.error(f"{type(e).__name__} at line {e.__traceback__.tb_lineno} of {__file__}: {e}")
+    finally:
+        if imap_connector:
+            try:
+                await imap_connector.logout()
+            except Exception as logout_error:
+                logger.debug(f"Failed to logout IMAP for {user_mail}: {logout_error}")
     return imap_messages
 
 def map_folder(folder: Optional[bytes]) -> Optional[str]:
@@ -1031,7 +1093,8 @@ def delete_messages(settings: SettingParams, use_log=True):
         token = get_user_token(user, settings)
         if token:
             msg["result"] = f"Message {settings.search_param["message_id"]} not found in {user} mailbox. See log for details."
-            asyncio.run(get_imap_messages_and_delete(user, token, search_msg, imap_messages ))
+            loop = get_or_create_event_loop()
+            loop.run_until_complete(get_imap_messages_and_delete(user, token, search_msg, imap_messages ))
         for msg in search_msg:
             logger.info(msg["result"])
 
