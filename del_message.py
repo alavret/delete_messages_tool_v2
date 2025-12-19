@@ -1092,7 +1092,7 @@ def delete_messages(settings: SettingParams, use_log=True):
         search_msg.append(msg)
         token = get_user_token(user, settings)
         if token:
-            msg["result"] = f"Message {settings.search_param["message_id"]} not found in {user} mailbox. See log for details."
+            msg["result"] = f'Message {settings.search_param["message_id"]} not found in {user} mailbox. See log for details.'
             loop = get_or_create_event_loop()
             loop.run_until_complete(get_imap_messages_and_delete(user, token, search_msg, imap_messages ))
         for msg in search_msg:
