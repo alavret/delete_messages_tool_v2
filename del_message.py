@@ -735,7 +735,7 @@ async def get_imap_messages_and_delete(user_mail: str, token: str, msg_to_search
                     break
                 logger.debug(f"IMAP auth failed for {user_mail}: {auth_response.result} {auth_response.lines}")
                 for msg in msg_to_search:
-                    msg["result"] = f"IMAP auth failed for {user_mail}: {auth_response.result}. See log for details."
+                    msg["result"] = f"IMAP auth failed for {user_mail}. See log for details."
             except Exception as connect_error:
                 logger.debug(f"IMAP connect attempt {attempt} failed for {user_mail}: {connect_error}")
                 for msg in msg_to_search:
