@@ -23,6 +23,7 @@ import aioimaplib
 from typing import Optional
 import time
 import json
+import base64
 
 
 DEFAULT_IMAP_SERVER = "imap.yandex.ru"
@@ -37,6 +38,10 @@ ALL_USERS_REFRESH_IN_MINUTES = 5
 USERS_PER_PAGE_FROM_API = 100
 MAX_RETRIES = 1
 RETRIES_DELAY_SEC = 2
+# Ограничение IMAP команд
+RPS_LIMIT = 20
+_last_call_imap = 0.0
+IMAP_FETCH_RETRY_ATTEMPTS = 5
 # Количество страниц для запроса логов последовательно в одном цикле последовательного обращения к API, после чего формируется новый набор стартовой и конечных дат
 OLD_LOG_MAX_PAGES = 10
 
@@ -715,6 +720,508 @@ def get_user_token(user_mail: str, settings: "SettingParams"):
         logger.debug(f"User token for {user_mail} received successfully - {response.json()['access_token']}")
         return response.json()["access_token"]
 
+
+def rate_limit_imap_commands():
+    global _last_call_imap
+    now = time.time()
+    delta = now - _last_call_imap
+    if delta < 1.0 / RPS_LIMIT:
+        time.sleep((1.0 / RPS_LIMIT) - delta)
+    _last_call_imap = time.time()
+
+
+def quote_imap_string(value: str) -> str:
+    if not value:
+        return '""'
+    if value.startswith('"') and value.endswith('"'):
+        return value
+    return f'"{value}"'
+
+
+def imap_utf7_decode(value: str) -> str:
+    if not value or "&" not in value:
+        return value
+    result = []
+    i = 0
+    while i < len(value):
+        if value[i] != "&":
+            result.append(value[i])
+            i += 1
+            continue
+        j = value.find("-", i)
+        if j == -1:
+            result.append("&")
+            break
+        if j == i + 1:
+            result.append("&")
+            i = j + 1
+            continue
+        chunk = value[i + 1:j].replace(",", "/")
+        pad = (-len(chunk)) % 4
+        if pad:
+            chunk += "=" * pad
+        try:
+            decoded = base64.b64decode(chunk).decode("utf-16-be")
+        except Exception:
+            decoded = ""
+        result.append(decoded)
+        i = j + 1
+    return "".join(result)
+
+
+def imap_utf7_encode(value: str) -> str:
+    if value is None:
+        return ""
+    result = []
+    buf = []
+
+    def flush_buf():
+        if not buf:
+            return
+        utf16 = "".join(buf).encode("utf-16-be")
+        enc = base64.b64encode(utf16).decode("ascii").rstrip("=")
+        result.append("&" + enc.replace("/", ",") + "-")
+        buf.clear()
+
+    for ch in value:
+        code = ord(ch)
+        if 0x20 <= code <= 0x7E and ch != "&":
+            flush_buf()
+            result.append(ch)
+        elif ch == "&":
+            flush_buf()
+            result.append("&-")
+        else:
+            buf.append(ch)
+    flush_buf()
+    return "".join(result)
+
+
+def parse_imap_list_line(folder_line: Optional[bytes]) -> Optional[dict]:
+    if not folder_line or folder_line == b"LIST Completed.":
+        return None
+    try:
+        decoded = folder_line.decode("utf-8", errors="replace").strip()
+    except Exception:
+        return None
+    match = re.match(r'^\((?P<flags>[^)]*)\)\s+(?P<delimiter>NIL|"[^"]*")\s+(?P<mailbox>.+)$', decoded)
+    if not match:
+        return None
+    flags_raw = match.group("flags").strip()
+    delimiter_raw = match.group("delimiter").strip()
+    mailbox_raw = match.group("mailbox").strip()
+    delimiter = None
+    if delimiter_raw and delimiter_raw != "NIL":
+        delimiter = delimiter_raw.strip('"')
+    if mailbox_raw.startswith('"') and mailbox_raw.endswith('"'):
+        mailbox_raw = mailbox_raw.strip('"')
+    if not mailbox_raw:
+        return None
+    return {
+        "flags": [flag for flag in flags_raw.split() if flag],
+        "delimiter": delimiter,
+        "mailbox": mailbox_raw,
+        "mailbox_display": imap_utf7_decode(mailbox_raw),
+    }
+
+
+async def reconnect_imap_session(
+    username: str, token: str, folder: str, thread_prefix: str = ""
+) -> aioimaplib.IMAP4_SSL:
+    """
+    Переподключение к IMAP с повторным выбором папки.
+    """
+    logger.warning(f"{thread_prefix}Reconnecting to IMAP, folder {folder}...")
+    imap_connector = aioimaplib.IMAP4_SSL(
+        host=DEFAULT_IMAP_SERVER, port=DEFAULT_IMAP_PORT
+    )
+    await imap_connector.wait_hello_from_server()
+    auth_response = await imap_connector.xoauth2(user=username, token=token)
+    if auth_response.result != "OK":
+        raise RuntimeError(f"IMAP auth failed for {username}: {auth_response.result} {auth_response.lines}")
+    rate_limit_imap_commands()
+    await imap_connector.select(folder)
+    logger.info(f"{thread_prefix}Reconnect completed")
+    return imap_connector
+
+
+async def connect_and_login_with_retry(
+    username: str, token: str, thread_prefix: str = ""
+) -> aioimaplib.IMAP4_SSL:
+    """
+    Подключение и XAUTH2 с повторными попытками.
+    """
+    invalid_auth_retry_done = False
+    invalid_auth_line = (
+        b"[AUTHENTICATIONFAILED] AUTHENTICATE invalid credentials or IMAP is disabled"
+    )
+    max_attempts = IMAP_FETCH_RETRY_ATTEMPTS
+
+    attempt = 0
+    while attempt < max_attempts:
+        attempt += 1
+        imap_connector = None
+        auth_ok = False
+        sleep_seconds = 0.5 * attempt
+        try:
+            imap_connector = aioimaplib.IMAP4_SSL(
+                host=DEFAULT_IMAP_SERVER, port=DEFAULT_IMAP_PORT
+            )
+            await imap_connector.wait_hello_from_server()
+            auth_response = await imap_connector.xoauth2(user=username, token=token)
+            if auth_response.result == "OK":
+                auth_ok = True
+                return auth_ok,imap_connector
+            first_line = auth_response.lines[0] if auth_response.lines else None
+            if isinstance(first_line, list) and len(first_line) == 1:
+                first_line = first_line[0]
+            is_invalid_auth_line = (
+                isinstance(first_line, (bytes, bytearray)) and invalid_auth_line in first_line
+            )
+            if is_invalid_auth_line:
+                if invalid_auth_retry_done:
+                    logger.error(
+                        f"Неверный токен или IMAP выключен или пользователь {username} никогда "
+                        "не входил в свой почтовый ящик."
+                    )
+                    return False,None
+                invalid_auth_retry_done = True
+                sleep_seconds = 1
+                logger.error(
+                    f"XAUTH2 для {username}, "
+                    "вернула AUTHENTICATIONFAILED, повтор через 0.5 секунды"
+                )
+            else:
+                logger.error(
+                    f"XAUTH2 ({username}) попытка {attempt}/{IMAP_FETCH_RETRY_ATTEMPTS} "
+                    f"завершилась ошибкой: {auth_response.result}"
+                )
+        except Exception as e:
+            logger.error(
+                f"XAUTH2 ({username}), попытка {attempt}/{IMAP_FETCH_RETRY_ATTEMPTS} "
+                f"завершилась ошибкой: {type(e).__name__}: {e}"
+            )
+            
+        finally:
+            if imap_connector and not auth_ok:
+                try:
+                    await imap_connector.logout()
+                except Exception:
+                    pass
+        await asyncio.sleep(sleep_seconds)
+
+    return False,None
+
+
+async def list_folders_with_retry(
+    imap_connector,
+    username: str,
+    token: str,
+    reference: str = '""',
+    pattern: str = "*",
+    thread_prefix: str = "",
+):
+    """
+    LIST с повторными попытками и переподключением IMAP.
+    """
+    last_exc = None
+
+    for attempt in range(1, IMAP_FETCH_RETRY_ATTEMPTS + 1):
+        try:
+            rate_limit_imap_commands()
+            list_response = await imap_connector.list(reference, pattern)
+            if isinstance(list_response, (list, tuple)) and len(list_response) >= 2:
+                result = list_response[0]
+                if result == "OK":
+                    return list_response, imap_connector
+            logger.warning(
+                f"{thread_prefix}LIST попытка {attempt}/{IMAP_FETCH_RETRY_ATTEMPTS} вернула "
+                f"{getattr(list_response, 'result', list_response)}"
+            )
+        except Exception as e:
+            last_exc = e
+            logger.warning(
+                f"{thread_prefix}LIST попытка {attempt}/{IMAP_FETCH_RETRY_ATTEMPTS} "
+                f"завершилась ошибкой: {type(e).__name__}: {e}"
+            )
+
+        try:
+            imap_connector = await reconnect_imap_session(
+                username, token, "INBOX", thread_prefix
+            )
+        except Exception as reconnect_error:
+            last_exc = reconnect_error
+            logger.error(
+                f"{thread_prefix}Не удалось переподключиться к IMAP при LIST: "
+                f"{type(reconnect_error).__name__}: {reconnect_error}"
+            )
+            await asyncio.sleep(0.5 * attempt)
+            continue
+
+        await asyncio.sleep(0.5 * attempt)
+
+    if last_exc:
+        raise last_exc
+    raise RuntimeError("Не удалось выполнить LIST после переподключений")
+
+
+async def list_all_folders_recursive(
+    imap_connector,
+    username: str,
+    token: str,
+    thread_prefix: str = "",
+):
+    """
+    Рекурсивно получает список всех папок почтового ящика.
+    """
+    folders = []
+    folders_set = set()
+    queue = [("", None)]
+    seen = set()
+
+    while queue:
+        parent_mailbox, parent_delimiter = queue.pop(0)
+        if parent_mailbox:
+            delimiter = parent_delimiter or "/"
+            pattern = f"{parent_mailbox}{delimiter}%"
+        else:
+            pattern = "%"
+
+        (status, list_lines), imap_connector = await list_folders_with_retry(
+            imap_connector=imap_connector,
+            username=username,
+            token=token,
+            reference='""',
+            pattern=quote_imap_string(pattern),
+            thread_prefix=thread_prefix,
+        )
+        if status != "OK":
+            continue
+
+        for folder_line in list_lines:
+            parsed = parse_imap_list_line(folder_line)
+            if not parsed:
+                continue
+            mailbox = parsed["mailbox"]
+            mailbox_quoted = quote_imap_string(mailbox)
+            if mailbox_quoted not in folders_set:
+                if not any(flag.lower() == "\\noselect" for flag in parsed["flags"]):
+                    folders.append(mailbox_quoted)
+                folders_set.add(mailbox_quoted)
+
+            flags = parsed["flags"]
+            has_no_children = any(flag.lower() == "\\hasnochildren" for flag in flags)
+            if not has_no_children:
+                delimiter = parsed["delimiter"] or parent_delimiter or "/"
+                queue_key = (mailbox, delimiter)
+                if queue_key not in seen:
+                    seen.add(queue_key)
+                    queue.append(queue_key)
+
+    return folders, imap_connector
+
+
+async def fetch_message_headers_with_retry(
+    imap_connector,
+    username: str,
+    token: str,
+    folder: str,
+    msg_num: int,
+    thread_prefix: str = "",
+):
+    """
+    Выполняет FETCH с повторными попытками и переподключением сессии IMAP.
+    """
+    last_exc = None
+    fetch_cmd = "(UID FLAGS BODY.PEEK[HEADER.FIELDS (%s)])" % " ".join(ID_HEADER_SET)
+
+    for attempt in range(1, IMAP_FETCH_RETRY_ATTEMPTS + 1):
+        try:
+            rate_limit_imap_commands()
+            fetch_response = await imap_connector.fetch(int(msg_num), fetch_cmd)
+            if fetch_response.result == "OK":
+                return fetch_response, imap_connector
+            logger.warning(
+                f"{thread_prefix}FETCH попытка {attempt}/{IMAP_FETCH_RETRY_ATTEMPTS} вернула {fetch_response.result}"
+            )
+        except Exception as e:
+            last_exc = e
+            logger.warning(
+                f"{thread_prefix}FETCH попытка {attempt}/{IMAP_FETCH_RETRY_ATTEMPTS} "
+                f"завершилась ошибкой: {type(e).__name__}: {e}"
+            )
+
+        try:
+            imap_connector = await reconnect_imap_session(
+                username, token, folder, thread_prefix
+            )
+        except Exception as reconnect_error:
+            last_exc = reconnect_error
+            logger.error(
+                f"{thread_prefix}Не удалось переподключиться к IMAP: "
+                f"{type(reconnect_error).__name__}: {reconnect_error}"
+            )
+            await asyncio.sleep(0.5 * attempt)
+            continue
+
+        await asyncio.sleep(0.5 * attempt)
+
+    if last_exc:
+        raise last_exc
+    raise RuntimeError("Не удалось получить заголовки сообщения после переподключений")
+
+
+async def select_folder_with_retry(
+    imap_connector,
+    username: str,
+    token: str,
+    folder: str,
+    thread_prefix: str = "",
+):
+    """
+    SELECT с повторными попытками и переподключением IMAP.
+    """
+    last_exc = None
+
+    for attempt in range(1, IMAP_FETCH_RETRY_ATTEMPTS + 1):
+        try:
+            rate_limit_imap_commands()
+            select_response = await imap_connector.select(folder)
+            result = getattr(select_response, "result", None)
+            if result is None and isinstance(select_response, (list, tuple)) and select_response:
+                result = select_response[0]
+            if result == "OK":
+                return select_response, imap_connector
+            logger.warning(
+                f"{thread_prefix}SELECT попытка {attempt}/{IMAP_FETCH_RETRY_ATTEMPTS} вернула {result}"
+            )
+        except Exception as e:
+            last_exc = e
+            logger.warning(
+                f"{thread_prefix}SELECT попытка {attempt}/{IMAP_FETCH_RETRY_ATTEMPTS} "
+                f"завершилась ошибкой: {type(e).__name__}: {e}"
+            )
+
+        try:
+            imap_connector = await reconnect_imap_session(
+                username, token, folder, thread_prefix
+            )
+        except Exception as reconnect_error:
+            last_exc = reconnect_error
+            logger.error(
+                f"{thread_prefix}Не удалось переподключиться к IMAP при SELECT: "
+                f"{type(reconnect_error).__name__}: {reconnect_error}"
+            )
+            await asyncio.sleep(0.5 * attempt)
+            continue
+
+        await asyncio.sleep(0.5 * attempt)
+
+    if last_exc:
+        raise last_exc
+    raise RuntimeError("Не удалось выполнить SELECT после переподключений")
+
+
+async def search_with_retry(
+    imap_connector,
+    username: str,
+    token: str,
+    folder: str,
+    search_criteria: str,
+    thread_prefix: str = "",
+):
+    """
+    SEARCH с повторными попытками и переподключением IMAP.
+    """
+    last_exc = None
+
+    for attempt in range(1, IMAP_FETCH_RETRY_ATTEMPTS + 1):
+        try:
+            rate_limit_imap_commands()
+            response = await imap_connector.search(search_criteria)
+            if response.result == "OK":
+                return response, imap_connector
+            logger.warning(
+                f"{thread_prefix}SEARCH попытка {attempt}/{IMAP_FETCH_RETRY_ATTEMPTS} вернула {response.result}"
+            )
+        except Exception as e:
+            last_exc = e
+            logger.warning(
+                f"{thread_prefix}SEARCH попытка {attempt}/{IMAP_FETCH_RETRY_ATTEMPTS} "
+                f"завершилась ошибкой: {type(e).__name__}: {e}"
+            )
+
+        try:
+            imap_connector = await reconnect_imap_session(
+                username, token, folder, thread_prefix
+            )
+        except Exception as reconnect_error:
+            last_exc = reconnect_error
+            logger.error(
+                f"{thread_prefix}Не удалось переподключиться к IMAP при SEARCH: "
+                f"{type(reconnect_error).__name__}: {reconnect_error}"
+            )
+            await asyncio.sleep(0.5 * attempt)
+            continue
+
+        await asyncio.sleep(0.5 * attempt)
+
+    if last_exc:
+        raise last_exc
+    raise RuntimeError("Не удалось выполнить SEARCH после переподключений")
+
+
+async def store_with_retry(
+    imap_connector,
+    username: str,
+    token: str,
+    folder: str,
+    msg_num: int,
+    thread_prefix: str = "",
+):
+    """
+    STORE с повторными попытками и переподключением IMAP.
+    """
+    last_exc = None
+
+    for attempt in range(1, IMAP_FETCH_RETRY_ATTEMPTS + 1):
+        try:
+            rate_limit_imap_commands()
+            response = await imap_connector.store(int(msg_num), "+FLAGS", "\\Deleted")
+            result = getattr(response, "result", None)
+            if result is None and isinstance(response, (list, tuple)) and response:
+                result = response[0]
+            if result == "OK":
+                return response, imap_connector
+            logger.warning(
+                f"{thread_prefix}STORE попытка {attempt}/{IMAP_FETCH_RETRY_ATTEMPTS} вернула {result}"
+            )
+        except Exception as e:
+            last_exc = e
+            logger.warning(
+                f"{thread_prefix}STORE попытка {attempt}/{IMAP_FETCH_RETRY_ATTEMPTS} "
+                f"завершилась ошибкой: {type(e).__name__}: {e}"
+            )
+
+        try:
+            imap_connector = await reconnect_imap_session(
+                username, token, folder, thread_prefix
+            )
+        except Exception as reconnect_error:
+            last_exc = reconnect_error
+            logger.error(
+                f"{thread_prefix}Не удалось переподключиться к IMAP при STORE: "
+                f"{type(reconnect_error).__name__}: {reconnect_error}"
+            )
+            await asyncio.sleep(0.5 * attempt)
+            continue
+
+        await asyncio.sleep(0.5 * attempt)
+
+    if last_exc:
+        raise last_exc
+    raise RuntimeError("Не удалось выполнить STORE после переподключений")
+
 async def get_imap_messages_and_delete(user_mail: str, token: str, msg_to_search: list, imap_messages: dict):
     message_dict = {}
     if not msg_to_search:
@@ -724,55 +1231,62 @@ async def get_imap_messages_and_delete(user_mail: str, token: str, msg_to_search
     logger.debug(f"Connect to IMAP server for {user_mail}")
     imap_connector = None
     try:
-        connection_established = False
-        for attempt in range(1, MAX_RETRIES + 1):
-            try:
-                imap_connector = aioimaplib.IMAP4_SSL(host=DEFAULT_IMAP_SERVER, port=DEFAULT_IMAP_PORT)
-                await imap_connector.wait_hello_from_server()
-                auth_response = await imap_connector.xoauth2(user=user_mail, token=token)
-                if auth_response.result == 'OK':
-                    connection_established = True
-                    break
-                logger.debug(f"IMAP auth failed for {user_mail}: {auth_response.result} {auth_response.lines}")
-                for msg in msg_to_search:
-                    msg["result"] = f"IMAP auth failed for {user_mail}. See log for details."
-            except Exception as connect_error:
-                logger.debug(f"IMAP connect attempt {attempt} failed for {user_mail}: {connect_error}")
-                for msg in msg_to_search:
-                    msg["result"] = f"IMAP connect attempt {attempt} failed for {user_mail}. See log for details."
-            if imap_connector:
-                try:
-                    await imap_connector.logout()
-                except Exception:
-                    pass
-                imap_connector = None
-            if attempt < MAX_RETRIES:
-                delay_seconds = RETRIES_DELAY_SEC * attempt
-                logger.debug(f"Retry IMAP connect for {user_mail} in {delay_seconds} seconds (attempt {attempt + 1}/{MAX_RETRIES})")
-                await asyncio.sleep(delay_seconds)
-        if not connection_established:
-            return imap_messages
+        auth_ok,imap_connector = await connect_and_login_with_retry(
+            username=user_mail,
+            token=token,
+        )
+        if not auth_ok:
+            for msg in msg_to_search:
+                msg["result"] = f"IMAP auth failed for {user_mail}. See log for details."
+            return message_dict
+
         logger.debug(f"Connect to IMAP server for {user_mail} successful")
-        status, folders = await imap_connector.list('""', "*")
-        folders = [map_folder(folder) for folder in folders if map_folder(folder)]
+
+        folders, imap_connector = await list_all_folders_recursive(
+            imap_connector=imap_connector,
+            username=user_mail,
+            token=token,
+        )
+
         for folder in folders:
-            logger.debug(f"Get messages from {folder}")
-            await imap_connector.select(folder)
+            folder_display = imap_utf7_decode(folder.strip('"'))
+            logger.debug(f"Get messages from {folder_display}")
+            _, imap_connector = await select_folder_with_retry(
+                imap_connector=imap_connector,
+                username=user_mail,
+                token=token,
+                folder=folder,
+            )
             for msg in msg_to_search:
                 msg_date = datetime.datetime.strptime(msg["message_date"], "%d-%m-%Y")
-                first_date =  msg_date + relativedelta(days = -msg["days_diff"], hour = 0, minute = 0, second = 0) 
-                last_date = msg_date + relativedelta(days = msg["days_diff"]+1, hour = 0, minute = 0, second = 0)
+                first_date = msg_date + relativedelta(days=-msg["days_diff"], hour=0, minute=0, second=0)
+                last_date = msg_date + relativedelta(days=msg["days_diff"] + 1, hour=0, minute=0, second=0)
                 search_id = f'<{msg["message_id"].replace("<", "").replace(">", "").strip()}>'
                 search_criteria = f'(SINCE {first_date.strftime("%d-%b-%Y")}) BEFORE {last_date.strftime("%d-%b-%Y")}'
-                response = await imap_connector.search(search_criteria)
+                response, imap_connector = await search_with_retry(
+                    imap_connector=imap_connector,
+                    username=user_mail,
+                    token=token,
+                    folder=folder,
+                    search_criteria=search_criteria,
+                )
                 if response.result == 'OK':
                     if len(response.lines[0]) > 0:
                         for num in response.lines[0].split():
                             message_dict = {}
-                            response = await imap_connector.fetch(int(num), '(UID FLAGS BODY.PEEK[HEADER.FIELDS (%s)])' % ' '.join(ID_HEADER_SET))
-                            if response.result == 'OK':
-                                for i in range(0, len(response.lines) - 1, 3):
-                                    fetch_command_without_literal = b'%s %s' % (response.lines[i], response.lines[i + 2])
+                            fetch_response, imap_connector = await fetch_message_headers_with_retry(
+                                imap_connector=imap_connector,
+                                username=user_mail,
+                                token=token,
+                                folder=folder,
+                                msg_num=int(num),
+                            )
+                            if fetch_response.result == 'OK':
+                                for i in range(0, len(fetch_response.lines) - 1, 3):
+                                    fetch_command_without_literal = b'%s %s' % (
+                                        fetch_response.lines[i],
+                                        fetch_response.lines[i + 2],
+                                    )
 
                                     uid = int(FETCH_MESSAGE_DATA_UID.match(fetch_command_without_literal).group('uid'))
                                     flags = FETCH_MESSAGE_DATA_FLAGS.match(fetch_command_without_literal).group('flags')
@@ -782,12 +1296,12 @@ async def get_imap_messages_and_delete(user_mail: str, token: str, msg_to_search
                                     message_dict["uid"] = uid
                                     message_dict["flags"] = flags.decode("ascii")
                                     message_dict["seqnum"] = int(seqnum.decode("ascii"))
-                                    message_dict["folder"] = folder
+                                    message_dict["folder"] = folder_display
                                     #print(message_attrs)
 
                                     # uid fetch always includes the UID of the last message in the mailbox
                                     # cf https://tools.ietf.org/html/rfc3501#page-61
-                                    message_headers = BytesHeaderParser().parsebytes(response.lines[i + 1])
+                                    message_headers = BytesHeaderParser().parsebytes(fetch_response.lines[i + 1])
                                     for header in message_headers.keys():
                                         decoded_to_intermediate = decode_header(message_headers[header])
                                         header_value = []
@@ -799,23 +1313,49 @@ async def get_imap_messages_and_delete(user_mail: str, token: str, msg_to_search
                                                     header_value.append(s[0].decode("ascii").strip())
                                                 else:
                                                     header_value.append(s[0])
-                                        #with concurrent.futures.ThreadPoolExecutor() as pool:
-                                        #    await loop.run_in_executor(pool, log_debug, f'{header}: {" ".join(header_value) if len(header_value) > 1 else header_value[0]}')
-                                        #print(f'{header}: {" ".join(header_value.split()) if len(header_value) > 1 else header_value[0]}')
-                                        message_dict[header.lower()] = f'{" ".join(header_value) if len(header_value) > 1 else header_value[0]}'
+                                        message_dict[header.lower()] = (
+                                            f'{" ".join(header_value) if len(header_value) > 1 else header_value[0]}'
+                                        )
+                            if "message-id" not in message_dict:
+                                continue
                             imap_messages[message_dict["message-id"]] = message_dict
                             if message_dict["message-id"] == search_id:
-                                if not settings.dry_run:    
-                                    logger.debug(f"Delete message {message_dict['message-id']} in {message_dict['folder']} for {user_mail}")
-                                    msg["result"] = f"Delete message {message_dict['message-id']} in {message_dict['folder']} for {user_mail}"
-                                    await imap_connector.store(int(num), "+FLAGS", "\\Deleted")
+                                if not settings.dry_run:
+                                    logger.debug(
+                                        f"Delete message {message_dict['message-id']} in "
+                                        f"{message_dict['folder']} for {user_mail}"
+                                    )
+                                    msg["result"] = (
+                                        f"Delete message {message_dict['message-id']} in "
+                                        f"{message_dict['folder']} for {user_mail}"
+                                    )
+                                    rate_limit_imap_commands()
+                                    _, imap_connector = await store_with_retry(
+                                        imap_connector=imap_connector,
+                                        username=user_mail,
+                                        token=token,
+                                        folder=folder,
+                                        msg_num=int(num),
+                                    )
                                 else:
-                                    logger.debug(f"DRY_RUN is TRUE: Virtually delete message {message_dict['message-id']} in {message_dict['folder']} for {user_mail}")
-                                    msg["result"] = f"DRY_RUN is TRUE: Virtually delete message {message_dict['message-id']} in {message_dict['folder']} for {user_mail}"
-            else:
-                continue
+                                    logger.debug(
+                                        "DRY_RUN is TRUE: Virtually delete message "
+                                        f"{message_dict['message-id']} in {message_dict['folder']} for {user_mail}"
+                                    )
+                                    msg["result"] = (
+                                        "DRY_RUN is TRUE: Virtually delete message "
+                                        f"{message_dict['message-id']} in {message_dict['folder']} for {user_mail}"
+                                    )
+                else:
+                    continue
 
+    except RuntimeError as e:
+        for msg in msg_to_search:
+            msg["result"] = f"IMAP error for {user_mail}. See log for details."
+        logger.error(f"{type(e).__name__} at line {e.__traceback__.tb_lineno} of {__file__}: {e}")
     except Exception as e:
+        for msg in msg_to_search:
+            msg["result"] = f"IMAP error for {user_mail}. See log for details."
         if "command LIST illegal in state NONAUTH" in str(e):
             logger.error(f"!!! ERRROR: Command LIST illegal in state NONAUTH for {user_mail}.")
             logger.error("Как правило, это означает, что почтовый ящик пользователя не инициализирован (пользователь ещё не входил в почтовый клиент).")
@@ -824,6 +1364,7 @@ async def get_imap_messages_and_delete(user_mail: str, token: str, msg_to_search
     finally:
         if imap_connector:
             try:
+                rate_limit_imap_commands()
                 await imap_connector.logout()
             except Exception as logout_error:
                 logger.debug(f"Failed to logout IMAP for {user_mail}: {logout_error}")
